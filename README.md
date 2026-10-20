@@ -208,7 +208,8 @@ const job = makeQueueNotifyJob({
 │   ├── quickstart.ps1
 │   └── quickstart.sh
 └── scripts/
-    └── verify-source.mjs    # 自检（语法 / 绝对路径 / 私有依赖 / 文件清单）
+    ├── verify-source.mjs    # 发布前自检（语法 / 绝对路径 / 私有依赖 / 文件清单）
+    └── selfcheck-replica.mjs # 装完之后自检（10 项，见 §9）
 ```
 
 程序化用法：
@@ -235,6 +236,65 @@ node scripts/verify-source.mjs
 2. 源码与脚本里**没有写死的绝对路径**（盘符 / 用户主目录 / 临时目录）；
 3. **没有私有依赖**：`dependencies` 为空，所有 `import` 只指向 `node:` 内置或本仓相对路径；
 4. `package.json` 与**文件清单一致**：`files` / `bin` / `main` / `exports` 指到的文件都存在。
+
+### 装完之后：10 项自检
+
+`verify-source` 管的是"这份源码能不能发"；装完之后还想知道**"这套环境装成了没有"**，跑这个：
+
+```sh
+node scripts/selfcheck-replica.mjs --home <你的状态根>
+# 自动化/机读：
+node scripts/selfcheck-replica.mjs --home <你的状态根> --json
+```
+
+它按"装完能不能用"排了 10 项：
+
+| # | 检查 | 判据 | 找不到时 |
+|---|---|---|---|
+| 1 | Node 版本 | ≥ `engines`（20） | — |
+| 2 | 状态根可写 | 能建/删临时文件（真实 home 只做 W_OK 只读探测） | FAIL |
+| 3 | DSH 主包在 | `--dsh-root` / `dsh --version` / `npm ls -g` | SKIP |
+| 4 | DSH 端口活着 | 任意 HTTP 响应都算活着（401 = 服务在但要凭据） | SKIP |
+| 5 | 看板插件加载 | 插件 entry 存在 + API 返回 tasks 数组（无凭据时 401 也算 entry 通过） | SKIP |
+| 6 | 记忆引擎可用 | `--memory-cmd` 的 `--probe` 退出码 0 | SKIP |
+| 7 | 会话工具在 | `session-mark --help` 退出码 0 | SKIP |
+| 8 | 状态文件就位 | 按 `docs/状态文件清单.md` 逐项判（必需件 + 坏 JSON） | FAIL |
+| 9 | tickd 能跑一轮 | `--once --json` 退出码 0、job 齐、日报产出 | SKIP（真实 home 需 `--allow-production`） |
+| 10 | 生产/夹具隔离 | 写闸 3 条自测 + 本次写入全在 home 内 | FAIL |
+
+**退出码**：`0` = 无 FAIL（SKIP 不阻断）· `3` = 有 FAIL · `2` = 用法错 / 安全拒跑。
+
+**只读为主**：默认唯一的写是 home 内一个临时探测文件（写完立刻删）；**真实 home 连它都不写**。
+要初始化缺失的状态文件用 `--fix` —— 它只跑一遍 `self-heal`，写入全在 home 内；
+对**真实 home**（`<用户主目录>/.dsh`）做写入型动作，必须再显式加 `--allow-production`。
+
+**找不到不是失败，指定了才算断言**：没装那件就是 SKIP（带原因 + 建议）。
+但只要**显式指定**了 `--dsh-root` / `--plugin-dir` / `--memory-cmd` / `--session-tool`，无效就报 FAIL
+—— 静默降级会骗人。
+
+**它自己会红的三个样例**（都是实测输出，路径用 `<…>` 隐去）：
+
+```
+# ① 缺件：home 里没有 ops-autonomy.json，且 job 注册表少了 daily-report
+8   状态文件就位        FAIL  必需件缺失 1 个（ops-autonomy.json）
+9   tickd 能跑一轮      FAIL  跑通了，但缺 job：daily-report（实际 queue-notify、self-heal）
+结果：PASS 3 · SKIP 5 · FAIL 2  ⇒  有未通过的检查项
+
+# ② 显式指定了坏目标（显式即断言）
+3   DSH 主包在          FAIL  --dsh-root 下没有 @deepseek-ai/dsh：<dir>
+4   DSH 端口活着        FAIL  http://127.0.0.1:39871：连接失败（ECONNREFUSED）
+5   看板插件加载        FAIL  --plugin-dir 下没有可加载的 entry：<dir>
+6   记忆引擎可用        FAIL  召回探针 rc=4：<probe 的 stderr>
+结果：PASS 3 · SKIP 0 · FAIL 7  ⇒  有未通过的检查项
+
+# ③ 写闸：对真实 home 加 --fix（不带 --allow-production）必须拒跑、零写入
+[REFUSE] --fix 拒写：home = <真实 home>（判定 production，原因 HOME_IS_PRODUCTION_WITHOUT_ALLOW）
+[REFUSE] 真实 home 需要显式 --allow-production；夹具 home 走 REPLICA_GUARD 执行器。零写入退出。
+（退出码 2）
+```
+
+**隔离自守**：在夹具/演练环境里跑时，执行器会注入 `REPLICA_GUARD=1` + `REPLICA_FIXTURE_ROOT`；
+本脚本据此断言 home 落在夹具树内，否则 `rc=2` 拒跑。直接裸跑（普通安装）时这两个变量不存在，按普通安装处理。
 
 ---
 

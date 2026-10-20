@@ -1,6 +1,6 @@
 {
   "name": "@kira905/dsh-butler-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Minimal, dependency-free skeleton of a self-maintaining ops loop for DSH: tick scheduler + autonomy matrix + queue notifications + daily report + audit log. Zero runtime dependencies.",
   "keywords": [
     "dsh",

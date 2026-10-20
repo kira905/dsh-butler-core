@@ -2,6 +2,26 @@
 
 本仓遵循语义化版本（`MAJOR.MINOR.PATCH`）。条目按版本倒序，最新在上。
 
+## 0.1.1 — 2026-10-20
+
+**装完之后的自检（replica selfcheck）。**
+
+### 新增
+
+- `scripts/selfcheck-replica.mjs`：10 项「装完能不能用」自检 —— Node 版本 / 状态根可写 / DSH 主包 /
+  DSH 端口 / 看板插件 / 记忆引擎 / 会话工具 / 状态文件 / tickd 跑一轮 / 生产-夹具隔离。
+  人类可读表 + `--json`；退出码 `0` 无 FAIL · `3` 有 FAIL · `2` 用法错或安全拒跑。
+- `--fix`：只跑一遍 `self-heal` 初始化缺失的状态文件（写入只在 home 内）；真实 home 需 `--allow-production`。
+- `--home` / `--dsh-root` / `--api-base` / `--plugin-dir` / `--memory-cmd` / `--session-tool` / `--tickd`
+  全部可显式指定，便于在夹具里逐项验证。**显式指定即断言**：指错就报 FAIL，不静默降级。
+- 隔离自守：`REPLICA_GUARD=1` + `REPLICA_FIXTURE_ROOT` 时断言 home 在夹具树内，否则 `rc=2` 拒跑。
+
+### 说明
+
+- 找不到某件 = SKIP + 原因（不是 FAIL）；对真实 home 默认零写入（#2 用 W_OK 只读探测）。
+- README §9 增「装完之后：10 项自检」+ 三个实测失败样例。
+- 零运行时依赖不变；`verify-source` 四类全过。
+
 ## 0.1.0 — 2026-10-20
 
 **最小可跑骨架首版（distilled skeleton first release）。**
