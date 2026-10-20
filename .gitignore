@@ -1,0 +1,19 @@
+# 源码与本地产物（本仓零依赖、无构建步骤，理论上不该出现）
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# 跑 quickstart 时产生的演示 home（默认落在当前目录）
+.ops-demo-home/
+.ops-demo-home-*/
+
+# 打包产物
+*.tgz
+
+# 临时 / 日志
+*.tmp
+*.bak
+*.bak-*
+.tmp-*/
+.DS_Store
+Thumbs.db

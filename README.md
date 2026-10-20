@@ -1,0 +1,264 @@
+# dsh-butler-core · 最小可跑运维骨架
+
+> 一个**零运行时依赖**的 Node.js 小骨架：定时调度 + 自主闸门 + 通知队列 + 日报 + 审计链。
+> 它给「长期在自己机器上跑 agent」的人用——先让一个循环能跑起来、能留下可查的痕迹，再谈自动化。
+
+**English README**: [README.en.md](./README.en.md)
+
+---
+
+## 0. 先说边界（很重要）
+
+**这是一份 distilled skeleton —— 提炼重写的最小骨架，不是生产全家桶的逐字副本。**
+
+- 代码是**独立重写**的：与任何一个"生产版大管家"里同名文件的 sha 都不同，多数没有同名源文件。
+  它保留的是**同一套纪律**（原子写 / 单例锁 / 哈希链审计 / fail-safe 闸门 / 幂等判据），
+  而不是同一批代码。
+- 它**不依赖** DSH 主包，也不需要宿主进程：`node` 直接跑，零 `dependencies`。
+- 它**只做**调度与记账，**不做**会话管理、看板、记忆、插件装载、面板 UI、跨机同步。
+
+如果你要的是"装完就能接管一整套 DSH 生态"，那不是一个包的事，看生态里的其它组件；
+如果你要的是"读得完、改得动、能嵌进自己脚本里"的最小运维环，这个包就是。
+
+---
+
+## 1. 给谁看
+
+| 你 | 你会用到它做什么 |
+|---|---|
+| 在自有机器上跑长期 agent 的人 | 让"每天该做的事"有个调度骨架：出日报、发通知、清过期锁 |
+| 想读一个不依赖框架的调度器的人 | 全套 17 个运行期 `.mjs`、一个文件一件事，没有隐式依赖 |
+| 想给自己的项目加"可追责自动化"的人 | 审计链（每条带 `prev`/`hash`）+ 双闸放行，抄走即可 |
+
+不适合：要开箱即用的运维平台、要图形界面、要跨机编排的人。
+
+---
+
+## 2. 三分钟跑起来
+
+需要 Node.js **>= 20**。不需要 `npm install`（零依赖）。
+
+### Windows（PowerShell）
+
+```powershell
+git clone <本仓地址>
+cd dsh-butler-core
+powershell -ExecutionPolicy Bypass -File .\examples\quickstart.ps1
+```
+
+### Linux / macOS
+
+```sh
+git clone <本仓地址>
+cd dsh-butler-core
+sh ./examples/quickstart.sh
+```
+
+### 或者直接一条命令
+
+```sh
+node bin/ops-tickd.mjs --once --home ./.ops-demo-home
+```
+
+> `quickstart` 默认把状态写到**当前目录下的 `.ops-demo-home`**，**不会碰你的 `~/.dsh`**。
+> 想换个位置：`-StateHome <目录>`（PowerShell）或 `OPS_CORE_HOME=<目录>`（sh）。
+
+跑完你会看到类似：
+
+```
+ops-tickd：home=.../.ops-demo-home · 档位=observe · 强制
+job            状态  耗时ms  说明
+queue-notify   ok    3       ok
+self-heal      ok    5       ok
+daily-report   ok    8       ok
+
+产物：.../.ops-demo-home/ops-reports/2026-10-20.md
+审计：.../.ops-demo-home/ops-audit
+
+档位：observe（只观察：写日报/审计/本地 outbox，不做修复）· 自主动作：全部关闭
+```
+
+再跑一次同一条命令：日报**不会重写**（内容逐字节相同就跳过），这就是幂等判据。
+
+---
+
+## 3. 一轮 tick 会留下什么
+
+| 产物 | 位置 | 一句话 |
+|---|---|---|
+| 日报 | `ops-reports/<日期>.md` | 档位 / 上一次 job 状态 / 状态文件健康 / 队列统计 / 告警条数 |
+| 审计流水 | `ops-audit/<年-月>.jsonl` | append-only，一行一条 JSON，带 `prev` + `hash` 哈希链 |
+| 通知产物 | `ops-notify-outbox.jsonl` | 默认通道 = 本地文件，一行一条"本该发出去的通知" |
+| 告警 | `ops-alert.log` | 组件自身故障（不是业务告警） |
+| 调度状态 | `ops-tickd.json` | 最近 50 次 tick 的读数 + 每个 job 的上次状态 |
+| 自愈流水 | `ops-heal-log.jsonl` | 初始化了哪些状态文件、清了哪些过期锁 |
+
+**想让它真的有东西可发**：往 `ops-queue.json` 里放一条
+`{ "items": [{ "level": "info", "message": "hello" }] }`，下一轮就会进 `ops-notify-outbox.jsonl`，
+并记进 `ops-notify-state.json` 的 `processed[]`（同一条不会发第二次）。
+
+---
+
+## 4. 状态文件清单（缺了会怎样）
+
+全部状态都在一个根目录下（`--home` > `OPS_CORE_HOME` > `DSH_HOME` > `~/.dsh`）。
+逐项的完整说明（谁写 / 是什么 / 备份 / 能不能出机器）见
+[docs/状态文件清单.md](./docs/状态文件清单.md)。
+
+| 文件 | 谁写 | 缺了会怎样 |
+|---|---|---|
+| `ops-autonomy.json` | `ops-autonomy` / `ops-tickd` | 自动建默认（`observe` + 全关）；**删了等于丢放行记录**（安全但麻烦） |
+| `ops-tickd.json` | `ops-tickd` | 自动建空状态；只影响"上次跑到哪"的参考值 |
+| `ops-queue.json` | **你**（唯一由使用者喂数据的文件） | 自动建空队列；没有它就没有通知可发 |
+| `ops-notify-state.json` | `queue-notify` job | 自动建空去重表；**手删会重发历史通知** |
+| `ops-notify-outbox.jsonl` | `queue-notify` job | 首次通知时自动创建；是产物，不是状态 |
+| `ops-audit/<年-月>.jsonl` | 所有写动作 | 首次写审计时自动建；**别删**，排障与追责的唯一凭据 |
+| `ops-alert.log` | 组件自身 | 首次告警时自动建；是产物 |
+| `ops-reports/<日期>.md` | `daily-report` job | 下一轮自动重建当天那份 |
+| `ops-locks/*.lock` | 调度器 | 首次加锁时自动建；进程崩溃会留过期锁（由自愈清理） |
+| `ops-heal-log.jsonl` | `self-heal` job | 首次修复动作时自动建；是产物 |
+| `ops-changelog/<年-月>.md` | `ops-changelog add` | 第一次记账时自动建 |
+
+> 本包**不读不写**任何凭据文件（例如宿主 home 里的 `.credentials.yaml`）；
+> 仓库与默认运行路径里**没有任何外发地址**。
+
+---
+
+## 5. 自主矩阵：谁可以自己动手
+
+默认值是**刻意保守**的：能写产物，不能修东西。
+
+| 项 | 默认 | 含义 |
+|---|---|---|
+| `mode` | `observe` | 只观察：写日报 / 审计 / 本地 outbox |
+| `mode=act` | 需显式切 | 允许"实际修复动作"发生（但还受下一行管） |
+| `auto.selfHeal` | `false` | 即使 `act`，也要这一项为 `true` 才清过期锁 |
+
+也就是说，自愈的实际动手需要**双闸**：`mode=act` **且** `auto.selfHeal=true`。
+判据 fail-safe：文件缺失 / 解析失败 / 字段不是 `true`，一律按"关"处理。
+
+```sh
+node bin/ops-autonomy.mjs status                       # 看档位与开关
+node bin/ops-autonomy.mjs mode act --why "手动清一次过期锁"
+node bin/ops-autonomy.mjs auto on selfHeal --why "同上"
+node bin/ops-autonomy.mjs module off daily-report      # 关掉某个 job（改开关，不改代码）
+```
+
+每次开关写盘都带 `by` / `why`，并落一行审计。
+
+---
+
+## 6. 接自己的通知通道
+
+默认通道只写本地 outbox。要发到自己的系统，**显式传入地址**（仓库内零默认地址）：
+
+```js
+import { makeQueueNotifyJob, webhookNotifier } from '@kira905/dsh-butler-core';
+
+const job = makeQueueNotifyJob({
+  home: '/path/to/home',
+  notifier: webhookNotifier({ url: process.env.MY_HOOK_URL, headers: { authorization: `Bearer ${process.env.MY_HOOK_TOKEN}` } }),
+});
+```
+
+`webhookNotifier` 只发一行 JSON（`source` / `level` / `message` / `at`），失败返回 `{ ok:false }`，**不抛错**；
+发送失败不会标记 `processed`，下一轮自动重试（同时落一条告警）。
+
+---
+
+## 7. 三条工程纪律（为什么它敢动你的目录）
+
+1. **原子写**：先写同目录临时文件 → `fsync` → `rename` 覆盖；失败重试 3 次，仍失败就保留 `.tmp` 并抛错，
+   **绝不退化为直接写目标**。
+2. **哈希链审计**：每条审计记录带 `prev`（上一条 hash）与自身 `hash`；任何删除/改写都会在
+   `ops-tickd --state` 的链校验里暴露。
+3. **单例锁 + 幂等**：每个 job 执行前用 `wx` 原子抢锁；抢不到 = 本轮跳过（不是失败）。
+   日报"内容相同就不写"，通知"同一条只发一次" —— 重复跑不产生重复记账。
+
+---
+
+## 8. 目录结构
+
+```
+.
+├── bin/
+│   ├── ops-tickd.mjs        # 跑一轮 / 常驻 / 只看状态
+│   ├── ops-autonomy.mjs     # 档位与开关
+│   └── ops-changelog.mjs    # 一句话记账（带幂等键）
+├── src/
+│   ├── paths.mjs            # 路径解析单点（home / 各状态文件）
+│   ├── store.mjs            # 原子写 / 读改写 / 单例锁
+│   ├── audit.mjs            # 审计链唯一写入口
+│   ├── alert.mjs            # 告警通道
+│   ├── autonomy.mjs         # 自主矩阵（档位 / 模块 / 自动动作）
+│   ├── scheduler.mjs        # 轻量调度器（无常驻进程）
+│   ├── registry.mjs         # 三个 job 的装配与顺序
+│   ├── state-files.mjs      # 状态文件清单的单一数据源
+│   ├── notify.mjs           # 通知适配器（file / webhook）
+│   ├── cli.mjs              # 极简参数解析与表格
+│   ├── index.mjs            # 程序化入口
+│   └── jobs/
+│       ├── queue-notify.mjs # 队列 → outbox（去重）
+│       ├── self-heal.mjs    # 初始化状态 / 清过期锁（双闸）
+│       └── daily-report.mjs # 日报（同日幂等）
+├── docs/
+│   ├── 架构一页.md
+│   └── 状态文件清单.md
+├── examples/
+│   ├── quickstart.ps1
+│   └── quickstart.sh
+└── scripts/
+    └── verify-source.mjs    # 自检（语法 / 绝对路径 / 私有依赖 / 文件清单）
+```
+
+程序化用法：
+
+```js
+import { createOpsScheduler } from '@kira905/dsh-butler-core';
+
+const { scheduler } = createOpsScheduler({ home: process.env.OPS_CORE_HOME });
+const run = await scheduler.tickOnce({ force: true });
+console.log(run.executed, run.failed);
+```
+
+---
+
+## 9. 自检
+
+```sh
+node scripts/verify-source.mjs
+```
+
+它会检查四类事，任一不满足即 `rc != 0`：
+
+1. 所有 `.mjs` 过 `node --check`；
+2. 源码与脚本里**没有写死的绝对路径**（盘符 / 用户主目录 / 临时目录）；
+3. **没有私有依赖**：`dependencies` 为空，所有 `import` 只指向 `node:` 内置或本仓相对路径；
+4. `package.json` 与**文件清单一致**：`files` / `bin` / `main` / `exports` 指到的文件都存在。
+
+---
+
+## 10. 它不做什么（避免误会）
+
+- 不提供**外发通道默认值**（企业微信 / 钉钉 / Slack 之类一概不带，只留一个显式 webhook 适配器）；
+- 不提供**定时器守护**：常驻循环只有 `--interval`，进程崩了要靠系统的计划任务 / systemd 拉起；
+- 不管理**宿主生命周期**（不启动、不重启、不杀任何服务）；
+- 不做**跨机同步**、不做**数据迁移**；
+- 不扫描、不读取、不上传你的任何文件——它只写自己那几个 `ops-*` 文件。
+
+---
+
+## 11. 许可
+
+**AGPL-3.0-only + 商业授权（双许可）**，见 [LICENSE](./LICENSE)。
+
+- 个人、学习、开源项目：按 **AGPL-3.0** 自由使用与修改（衍生作品需同样以 AGPL 开源）。
+- 需要在**闭源 / 商业场景**使用（AGPL 的传染条款不适用）：可另行获取**商业授权**。
+  本仓暂无公开联系邮箱，**请通过本仓 Issue 联系**。
+
+> 说明：**AGPL / MIT / Apache 本身都不禁止商用**；这里的"双许可"含义是
+> 「**要么按 AGPL 开源衍生作品，要么购买商业授权**」，与"文档侧禁商用"不是一回事。
+
+---
+
+<sub>本仓是「最小可跑骨架」：先把循环跑起来并留下痕迹，再往上加东西。</sub>

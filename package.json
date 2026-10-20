@@ -1,0 +1,57 @@
+{
+  "name": "@kira905/dsh-butler-core",
+  "version": "0.1.0",
+  "description": "Minimal, dependency-free skeleton of a self-maintaining ops loop for DSH: tick scheduler + autonomy matrix + queue notifications + daily report + audit log. Zero runtime dependencies.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "ops",
+    "autonomy",
+    "scheduler",
+    "self-healing",
+    "audit"
+  ],
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./scheduler": "./src/scheduler.mjs",
+    "./store": "./src/store.mjs",
+    "./paths": "./src/paths.mjs",
+    "./autonomy": "./src/autonomy.mjs",
+    "./state-files": "./src/state-files.mjs"
+  },
+  "bin": {
+    "ops-tickd": "./bin/ops-tickd.mjs",
+    "ops-autonomy": "./bin/ops-autonomy.mjs",
+    "ops-changelog": "./bin/ops-changelog.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "examples",
+    "docs",
+    "scripts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "verify": "node scripts/verify-source.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "AGPL-3.0-only",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitee.com/kira905/dsh-butler-core.git"
+  },
+  "homepage": "https://gitee.com/kira905/dsh-butler-core#readme",
+  "bugs": {
+    "url": "https://gitee.com/kira905/dsh-butler-core/issues"
+  }
+}
