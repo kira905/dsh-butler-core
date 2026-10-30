@@ -13,6 +13,27 @@ import path from 'node:path';
 import { parseArgs, numArg } from '../src/cli.mjs';
 import { dayKey, ensureDir, monthKey, opsPaths, resolveHome } from '../src/paths.mjs';
 import { writeTextAtomic } from '../src/store.mjs';
+import { cliGuard } from '../src/cli-args.mjs';
+
+const SPEC = {
+  cmd: 'ops-changelog',
+  summary: '记账最小件：往变更流水里追加一行（同一 key 只写一次，重复执行打印 skipped）。',
+  usage: 'ops-changelog <add|tail> [--text "改了什么"] [--key <幂等键>] [--file <目标.md>] [--limit 20]',
+  commands: [
+    { name: 'add', desc: '追加一条（默认动作）' },
+    { name: 'tail', desc: '只看最近几条（只读）' },
+  ],
+  flags: [
+    { name: '--text', arg: '文本', desc: 'add 要记的那一行' },
+    { name: '--key', arg: '键', desc: '幂等键，默认取文本的哈希前 8 位' },
+    { name: '--file', arg: '文件', desc: '写到指定 Markdown（默认写数据根下的月度流水档）' },
+    { name: '--limit', arg: 'N', desc: 'tail 看几条，默认 20' },
+  ],
+  writes: 'add 会真的往目标 Markdown 追加一行（最新在上）；tail 只读。',
+  exits: '0 成功 · 1 写失败 · 2 参数错误',
+  examples: ['ops-changelog add --text "修了什么"', 'ops-changelog tail --limit 5'],
+};
+cliGuard(SPEC);
 
 const args = parseArgs(process.argv.slice(2));
 const [cmd = 'add'] = args._;

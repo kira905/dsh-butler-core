@@ -12,6 +12,30 @@
 import { parseArgs } from '../src/cli.mjs';
 import { describe, readAutonomy, setAuto, setJob, setMode, setModule, MODULES, AUTO_ACTIONS, MODES } from '../src/autonomy.mjs';
 import { resolveHome } from '../src/paths.mjs';
+import { cliGuard } from '../src/cli-args.mjs';
+
+const SPEC = {
+  cmd: 'ops-autonomy',
+  summary: '自主矩阵 CLI：看当前档位、开关模块 / job / 自动动作。所有写动作都带 --by / --why，并落一行审计。',
+  usage: 'ops-autonomy <status|mode|module|job|auto> [参数] [--json]',
+  commands: [
+    { name: 'status', desc: '只读：打印档位、模块、自动动作、job 级覆盖（默认动作）' },
+    { name: 'mode', desc: 'mode observe|report|act：改自主档位' },
+    { name: 'module', desc: 'module on|off <id>：开关一个模块' },
+    { name: 'job', desc: 'job on|off <id>：job 级覆盖' },
+    { name: 'auto', desc: 'auto on|off <id>：开关一个自动动作' },
+  ],
+  flags: [
+    { name: '--by', arg: '谁', desc: '写动作的操作者（默认取环境变量里的用户名）' },
+    { name: '--why', arg: '原因', desc: '写动作的原因，随审计行一起落盘' },
+    { name: '--json', desc: '机器可读输出（status）' },
+    { name: '--home', arg: '目录', desc: '状态根，默认自动解析' },
+  ],
+  writes: 'mode / module / job / auto 会改状态根下的自主矩阵状态文件，并追加一行审计；status 只读。',
+  exits: '0 成功 · 1 执行失败 · 2 参数错误',
+  examples: ['ops-autonomy status', 'ops-autonomy module on selfHeal --by me --why "手动修一次"'],
+};
+cliGuard(SPEC);
 
 const args = parseArgs(process.argv.slice(2));
 const [cmd = 'status', verb, id] = args._;
