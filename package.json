@@ -1,6 +1,6 @@
 {
   "name": "@kira905/dsh-butler-core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Minimal, dependency-free skeleton of a self-maintaining ops loop for DSH: tick scheduler + autonomy matrix + queue notifications + daily report + audit log. Zero runtime dependencies.",
   "keywords": [
     "dsh",
@@ -32,12 +32,14 @@
     "examples",
     "docs",
     "scripts",
+    "test",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "verify": "node scripts/verify-source.mjs"
+    "verify": "node scripts/verify-source.mjs",
+    "test": "node test/run-all.mjs"
   },
   "engines": {
     "node": ">=20"

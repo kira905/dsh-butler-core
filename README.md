@@ -19,8 +19,9 @@ Get-Content <数据根>/profiles/<profile>/package.json | Select-String "@kira90
 
 # ③ 命令在不在 —— 【只查存在，不执行】
 Test-Path <数据根>/profiles/<profile>/node_modules/.bin/ops-autonomy.CMD   # 装进 profile 的
-Test-Path "$env:APPDATA\npm\ops-autonomy.CMD"                           # npm i -g 装的
+Test-Path <npm 全局 bin 目录>/ops-autonomy.CMD                             # npm i -g 装的
 # 期望：True。两条路径按你实际用的装法挑一条
+# <npm 全局 bin 目录> 用 `npm prefix -g` 查（Windows 上通常是 node 安装目录旁边那个 npm 目录）
 ```
 
 > 探针只做存在性检查（只看命令文件在不在，不执行任何命令）。
@@ -235,9 +236,18 @@ const job = makeQueueNotifyJob({
 ├── examples/
 │   ├── quickstart.ps1
 │   └── quickstart.sh
-└── scripts/
-    ├── verify-source.mjs    # 发布前自检（语法 / 绝对路径 / 私有依赖 / 文件清单）
-    └── selfcheck-replica.mjs # 装完之后自检（10 项，见 §9）
+├── scripts/
+│   ├── verify-source.mjs    # 发布前自检（语法 / 绝对路径 / 私有依赖 / 文件清单）
+│   ├── selfcheck-replica.mjs # 装完之后自检（13 项，见 §9）
+│   └── lib/                 # 自检用的零依赖件（清单校验 / 版本区间 / 路径解析 / dump 解析 / 探针计划）
+│       ├── manifest.mjs     #   清单校验（与安装器同源；每条错误带行号）
+│       ├── semver.mjs       #   版本区间三态判定（yes / no / unknown）
+│       ├── global-paths.mjs #   全局安装位置解析（**零 spawn**，只读盘）
+│       ├── dump-parse.mjs   #   --dump-config 解析 + 挂载四格判定（纯函数）
+│       ├── probe-plan.mjs   #   探针该不该跑（禁跑未核 --help）+ 整批墙钟
+│       └── default-manifest.mjs # 内置兜底清单（3 项）
+└── test/
+    └── run-all.mjs          # 夹具总入口（假 home / 假 profile / 假包 / 假 dump，全部临时目录）
 ```
 
 程序化用法：
@@ -265,7 +275,7 @@ node scripts/verify-source.mjs
 3. **没有私有依赖**：`dependencies` 为空，所有 `import` 只指向 `node:` 内置或本仓相对路径；
 4. `package.json` 与**文件清单一致**：`files` / `bin` / `main` / `exports` 指到的文件都存在。
 
-### 装完之后：10 项自检
+### 装完之后：13 项自检
 
 `verify-source` 管的是"这份源码能不能发"；装完之后还想知道**"这套环境装成了没有"**，跑这个：
 
@@ -273,15 +283,17 @@ node scripts/verify-source.mjs
 node scripts/selfcheck-replica.mjs --home <你的状态根>
 # 自动化/机读：
 node scripts/selfcheck-replica.mjs --home <你的状态根> --json
+# 按装机清单逐项判（推荐：清单跟安装器共用同一份）
+node scripts/selfcheck-replica.mjs --home <你的状态根> --manifest <suite-manifest.json> --profile web
 ```
 
-它按"装完能不能用"排了 10 项：
+它按"装完能不能用"排了 13 项 —— 前 10 项判"这套骨架本身"，后 3 项按**清单**判"你装的那些组件"：
 
 | # | 检查 | 判据 | 找不到时 |
 |---|---|---|---|
 | 1 | Node 版本 | ≥ `engines`（20） | — |
 | 2 | 状态根可写 | 能建/删临时文件（真实 home 只做 W_OK 只读探测） | FAIL |
-| 3 | DSH 主包在 | `--dsh-root` / `dsh --version` / `npm ls -g` | SKIP |
+| 3 | DSH 主包在 | `--dsh-root` / **读全局 `node_modules` 的 `package.json`** / `dsh --version` / `npm ls -g` | SKIP |
 | 4 | DSH 端口活着 | 任意 HTTP 响应都算活着（401 = 服务在但要凭据） | SKIP |
 | 5 | 看板插件加载 | 插件 entry 存在 + API 返回 tasks 数组（无凭据时 401 也算 entry 通过） | SKIP |
 | 6 | 记忆引擎可用 | `--memory-cmd` 的 `--probe` 退出码 0 | SKIP |
@@ -289,6 +301,30 @@ node scripts/selfcheck-replica.mjs --home <你的状态根> --json
 | 8 | 状态文件就位 | 按 `docs/状态文件清单.md` 逐项判（必需件 + 坏 JSON） | FAIL |
 | 9 | tickd 能跑一轮 | `--once --json` 退出码 0、job 齐、日报产出 | SKIP（真实 home 需 `--allow-production`） |
 | 10 | 生产/夹具隔离 | 写闸 3 条自测 + 本次写入全在 home 内 | FAIL |
+| 11 | 包在不在 / 版本对不对 | **分两路**：`plugin` 类读 profile 的 `dependencies` + 实体 `package.json` 的 `version`；`cli` 类查全局（也看 profile）。两处都没有才 FAIL | FAIL |
+| 12 | 挂载生效没 | 四格：包自己的 `dsh.bundle` × profile 的 `dsh.profile.bundles` × `--dump-config` 的组合树；外加"登记了但包没声明""撞 id/同 name""抢同一个记忆位置" | FAIL |
+| 13 | 关键能力能不能跑 | 每项探针由清单给：`existence`（只查存在，零执行）/ `help`（**仅限核过 `--help` 的命令**）/ `cmd`（清单指定的只读命令）；统一 8 秒超时 + 整批墙钟 30 秒 | FAIL |
+
+**第 11/12/13 项是清单驱动的**，清单优先取 `--manifest`；不给就自动找全局装着的
+`@kira905/dsh-butler-install/suite-manifest.json`（和安装器读同一份真相）；都没有才用**内置 3 项兜底**，
+输出里会写明用的是哪一份。旧 10 项不读清单，行为与以前一致。
+
+第 11 项的 `cli` 类 detail 会写清**装在哪**（全局 / profile / 都没有），因为"不知道该往哪看"正是它要回答的问题。
+版本判定是三态：区间内 / 区间外 / **无法判定**（带预发布后缀的实体版本本工具不猜，一律不算通过）。
+
+**第 12 项的两条诚实边界（结论要跟这两句一起读）**：
+
+1. 它判的是**组合**，不是运行时 —— `--dump-config` 只证明"组合树里有这一行"，
+   **不证明"运行时没崩"**。真要验"没崩"，只能人工起一次 `dsh web --no-open` 看日志。
+2. `--dump-config` 抓不到**"撞 id"以外的运行时冲突** —— 两个不同 `id` 抢同一位置时 dump 里是两行、
+   宿主也不报错（要等插件自己抛 "already registered"）。所以第 12 项只覆盖"同 id / 同 name"这一种，
+   **别把它当万能判据**。
+
+```sh
+# 第 12 项相关的两个开关（离线核对 / 不想起子进程时用）
+node scripts/selfcheck-replica.mjs --dump-config-file <一份 dump 文本>   # 零执行，只解析
+node scripts/selfcheck-replica.mjs --no-dump                            # 组合树维度直接降级 SKIP
+```
 
 **退出码**：`0` = 无 FAIL（SKIP 不阻断）· `3` = 有 FAIL · `2` = 用法错 / 安全拒跑。
 
@@ -323,6 +359,17 @@ node scripts/selfcheck-replica.mjs --home <你的状态根> --json
 
 **隔离自守**：在夹具/演练环境里跑时，执行器会注入 `REPLICA_GUARD=1` + `REPLICA_FIXTURE_ROOT`；
 本脚本据此断言 home 落在夹具树内，否则 `rc=2` 拒跑。直接裸跑（普通安装）时这两个变量不存在，按普通安装处理。
+
+**改了这个仓的判据之后**：先跑夹具，再谈交付。
+
+```sh
+node test/run-all.mjs
+```
+
+166 条断言，覆盖：清单校验 / 版本三态 / 段解析与撞车口径 / 跳过归因 / 四格每一格 /
+W1 的零 spawn 探测 / 旧 10 项不受清单影响 / 第 11–13 项端到端（假 home + 假包 + 假 dump）/
+**变异测试**（把四格任意一条判定改反 ⇒ 夹具必须红）。夹具只用系统临时目录里的假件，
+不读也不写任何真实安装。
 
 ---
 

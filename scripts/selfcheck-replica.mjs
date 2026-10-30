@@ -20,7 +20,18 @@
 //
 // 用法：
 //   node scripts/selfcheck-replica.mjs [--home <dir>] [--json] [--fix] [--allow-production]
+//   node scripts/selfcheck-replica.mjs --manifest <file> --profile web
 //   node scripts/selfcheck-replica.mjs --help
+//
+// 13 项 = 旧 10 项 + 第 11/12/13 项（包在不在 / 挂载生效没 / 关键能力能不能跑）。
+// 后三项是**清单驱动**的：清单来自 --manifest，或自动发现安装器随包发布的 suite-manifest.json，
+// 都没有就用内置 3 项兜底（见 scripts/lib/default-manifest.mjs）。旧 10 项不读清单。
+//
+// 第 12 项的两条诚实边界（必须和结论一起读）：
+//   ① 它判的是**组合**，不是运行时 —— dump 只证明"组合树里有这一行"，不证明"运行时没崩"；
+//      真要验后者，得人工起一次 `dsh web --no-open` 看日志。
+//   ② dump 抓不到"撞 id"以外的运行时冲突 —— 两个不同 id 抢同一位置时 dump 两行、宿主不报错，
+//      本项只覆盖"同 id / 同 name"这一种，别当万能判据。
 //
 // 选项：
 //   --home <dir>            状态根（默认 OPS_CORE_HOME > DSH_HOME > <用户主目录>/.dsh）
@@ -34,6 +45,11 @@
 //   --session-tool <file>   显式指定 session-mark 脚本（默认探测 PATH）
 //   --tickd <file>          显式指定 ops-tickd（默认本仓 bin/ops-tickd.mjs）
 //   --expect-jobs a,b,c     期望 tickd 跑出的 job（默认 queue-notify,self-heal,daily-report）
+//   --manifest <file>       装机清单（默认自动发现安装器那份，再退内置 3 项兜底）
+//   --profile <name>        判挂载用哪个 profile（默认自动：profiles 下唯一一个，多个优先 web）
+//   --dump-config-file <f>  用离线 dump 文本代替跑 `dsh --dump-config`（零执行，夹具/离线核对用）
+//   --no-dump               不跑 --dump-config（第 12 项的组合树维度降级 SKIP）
+//   --probe-batch <ms>      第 13 项整批墙钟上限（默认 30000）
 //   --min-node <n>          覆盖 Node 最低版本（默认读 package.json engines；自测用）
 //   --timeout <ms>          外部命令/网络超时（默认 8000）
 //   --no-net                不探测网络（跳过端口/插件 API 两段）
@@ -48,6 +64,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { loadManifest, loadManifestObject, formatManifestError, ManifestError } from './lib/manifest.mjs';
+import { parseRange, describeRange, satisfies } from './lib/semver.mjs';
+import { findGlobalPackage, findPackageInRoot, resolveCommand, spawnPlan, pathDirs } from './lib/global-paths.mjs';
+import { summarizeDump, parseSkipLines, findCollisions, judgeMount, SKIP_ATTRIBUTION } from './lib/dump-parse.mjs';
+import { planProbe, shouldDegradeBatch } from './lib/probe-plan.mjs';
+import { DEFAULT_MANIFEST, DEFAULT_MANIFEST_SOURCE_NOTE } from './lib/default-manifest.mjs';
 
 const SELF = fs.realpathSync(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(path.dirname(SELF), '..');   // 仓根（含 bin/ src/ docs/）
@@ -56,10 +78,10 @@ const SELF_REL = 'scripts/selfcheck-replica.mjs';
 // ---------------------------------------------------------------- 参数
 const KNOWN_VALUES = new Set([
   'home', 'dsh-root', 'api-base', 'plugin-dir', 'memory-cmd', 'session-tool', 'tickd',
-  'expect-jobs', 'min-node', 'timeout',
+  'expect-jobs', 'min-node', 'timeout', 'manifest', 'profile', 'dump-config-file', 'probe-batch',
 ]);
 const KNOWN_FLAGS = new Set([
-  'json', 'fix', 'allow-production', 'no-net', 'no-npm', 'verbose', 'help',
+  'json', 'fix', 'allow-production', 'no-net', 'no-npm', 'verbose', 'help', 'no-dump',
 ]);
 
 function parseArgv(argv) {
@@ -106,12 +128,29 @@ function usage() {
   --session-tool <file>   显式指定 session-mark 脚本
   --tickd <file>          显式指定 ops-tickd（默认本仓 bin/ops-tickd.mjs）
   --expect-jobs a,b,c     期望的 job 名单（默认 queue-notify,self-heal,daily-report）
+  --manifest <file>       装机清单（默认自动发现安装器那份，再退内置 3 项兜底）
+  --profile <name>        判挂载用哪个 profile（默认自动：唯一一个，多个优先 web）
+  --dump-config-file <f>  用离线 dump 文本代替跑 --dump-config（零执行）
+  --no-dump               不跑 --dump-config（第 12 项组合树维度降级 SKIP）
+  --probe-batch <ms>      第 13 项整批墙钟上限（默认 30000；超了剩余探针整体降级 SKIP）
   --min-node <n>          覆盖 Node 最低版本（自测用）
   --timeout <ms>          外部命令/网络超时（默认 8000）
   --no-net                不探测网络
   --no-npm                不调 npm
   --verbose               打印探测细节
   --help                  本帮助
+
+第 11/12/13 项（包在不在 / 挂载生效没 / 关键能力能不能跑）由清单驱动：
+每项写 包名 / 类型 / 期望版本区间 / 探针。清单优先取 --manifest 指的那份，
+其次自动发现全局装着的 @kira905/dsh-butler-install/suite-manifest.json，
+都没有才用内置 3 项兜底（输出里会写明用的是哪一份）。
+旧 10 项不读清单，行为与改造前一致（第 3 项是 W1 修好的自动探测）。
+
+两条诚实边界（第 12 项）：
+  · 它判的是**组合**，不是运行时 —— dump 只证明"组合树里有这一行"，
+    "运行时没崩"只能人工起一次服务看日志。
+  · dump 抓不到"撞 id"以外的运行时冲突（不同 id 抢同一位置 ⇒ dump 两行、宿主不报错），
+    本项只覆盖"同 id / 同 name"这一种。
 
 退出码：0 = 无 FAIL（SKIP 不阻断）· 3 = 有 FAIL · 2 = 用法错 / 安全拒跑`;
   return text;
@@ -223,6 +262,30 @@ function runCmd(cmd, args, { timeout = TIMEOUT, label = '' } = {}) {
   const r = spawnSync(cmd, args, { encoding: 'utf8', timeout, windowsHide: true, shell: false, env: { ...process.env } });
   if (VERBOSE) diag(`[probe] ${label || cmd} → rc=${r.status}${r.error ? ' err=' + (r.error.code ?? r.error.message) : ''}`);
   return { rc: typeof r.status === 'number' ? r.status : null, stdout: r.stdout ?? '', stderr: r.stderr ?? '', error: r.error ?? null };
+}
+
+/**
+ * 跑一份"执行计划"（由 global-paths 的 spawnPlan 产出）。
+ * 与 runCmd 的区别：它已经知道这条命令该用 node 直跑还是该经壳，所以能跨平台跑通
+ * `.cmd` / `.ps1` 这类 Windows 壳命令 —— 直接 spawn 它们会 EINVAL。
+ */
+function runPlan(plan, { timeout = TIMEOUT, label = '', extraEnv = null } = {}) {
+  if (!plan) return { rc: null, stdout: '', stderr: '', error: { code: 'NO_PLAN' } };
+  const r = spawnSync(plan.cmd, plan.args, {
+    encoding: 'utf8',
+    timeout,
+    windowsHide: true,
+    shell: false,
+    env: extraEnv ? { ...process.env, ...extraEnv } : { ...process.env },
+  });
+  if (VERBOSE) diag(`[probe] ${label || plan.cmd} → rc=${r.status}${r.error ? ' err=' + (r.error.code ?? r.error.message) : ''}`);
+  return { rc: typeof r.status === 'number' ? r.status : null, stdout: r.stdout ?? '', stderr: r.stderr ?? '', error: r.error ?? null };
+}
+
+/** 从任意文本里抠第一个 semver（`0.2.0-rc.2` 这种带预发布后缀的也算） */
+function firstVersion(text) {
+  const m = /\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(String(text ?? ''));
+  return m ? m[1] : null;
 }
 
 async function httpProbe(url, timeoutMs = TIMEOUT) {
@@ -340,11 +403,37 @@ function checkDshPackage() {
     return;
   }
 
-  const cli = runCmd('dsh', ['--version'], { timeout: Math.min(TIMEOUT, 5000), label: 'dsh --version' });
-  if (cli.rc === 0) {
-    add(3, 'DSH 主包在', 'PASS', `dsh --version → ${tail(cli.stdout || cli.stderr, 80)}`);
+  // ★ W1 修点：自动探测**先读盘**，不再靠 spawn —— Windows 上 `dsh` / `npm` 是
+  //   `.cmd` / `.ps1` 壳，`shell: false` 时 spawn 必 ENOENT（点 `.cmd` 还会 EINVAL），
+  //   于是旧版这条分支在 Windows 上永远 SKIP，而主包其实装着。
+  const disk = findGlobalPackage('@deepseek-ai/dsh');
+  if (disk) {
+    add(
+      3,
+      'DSH 主包在',
+      'PASS',
+      `找到 @deepseek-ai/dsh@${String(disk.pkg.version ?? '?')}（读全局 node_modules：${disk.root}；读盘探测，未起外部进程）`,
+    );
     return;
   }
+
+  // ② 兜底：把 `dsh` 命令解析成执行计划（还是只读盘）。解析到包内 JS 入口才真跑一次，
+  //    这样跨平台一致，也不用碰 Windows 的壳。
+  const resolved = resolveCommand('dsh');
+  if (resolved && resolved.kind === 'node') {
+    const r = runPlan(spawnPlan(resolved, ['--version']), { timeout: Math.min(TIMEOUT, 5000), label: 'dsh --version' });
+    const ver = firstVersion(r.stdout) || firstVersion(r.stderr) || resolved.version;
+    if (r.rc === 0 && ver) {
+      add(3, 'DSH 主包在', 'PASS', `dsh --version → ${ver}（${resolved.packageName}；入口 ${path.relative(resolved.packageDir, resolved.file) || resolved.file}）`);
+      return;
+    }
+    if (ver) {
+      add(3, 'DSH 主包在', 'PASS', `找到 ${resolved.packageName}@${ver}（--version 退出码 ${r.rc ?? 'null'}，但包在）`);
+      return;
+    }
+  }
+
+  // ③ 老路径兜底：npm ls -g（Linux/macOS 上 npm 是 shim，这条仍然有效）
   if (!F['no-npm']) {
     const npm = runCmd('npm', ['ls', '-g', '@deepseek-ai/dsh', '--depth=0'], { timeout: Math.min(TIMEOUT, 8000), label: 'npm ls -g' });
     if (npm.rc === 0 && /@deepseek-ai\/dsh@/.test(npm.stdout)) {
@@ -352,7 +441,13 @@ function checkDshPackage() {
       return;
     }
   }
-  add(3, 'DSH 主包在', 'SKIP', '未发现 DSH 主包（`dsh` 不在 PATH，npm 全局也没有）—— 只装骨架时可以忽略', '装主包：npm i -g @deepseek-ai/dsh；装了但不在 PATH 时用 --dsh-root 指过去');
+  add(
+    3,
+    'DSH 主包在',
+    'SKIP',
+    '未发现 DSH 主包（全局 node_modules 里没有 @deepseek-ai/dsh，PATH 里也没有能跑的 dsh）—— 只装骨架时可以忽略',
+    '装主包：npm i -g @deepseek-ai/dsh；装了但不在 PATH / 不在全局目录时用 --dsh-root 指过去',
+  );
 }
 
 // 4 ---------------------------------------------------------------- DSH 端口
@@ -596,6 +691,544 @@ function checkIsolation() {
     `写闸 3/3 通过 · 本次目标 = ${kind}${v.writable ? '（可写）' : '（只读）'} · 写入 ${wrote} 次全在 home 内`);
 }
 
+// ---------------------------------------------------------------- 清单 / profile / dump（第 11–13 项共用）
+/**
+ * 一次运行里这些只该算一次，所以放上下文里：
+ *   manifest —— 清单（显式 / 自动发现 / 内置兜底，三选一）
+ *   profile  —— 判挂载用哪个 profile 目录
+ *   dump     —— `--dump-config` 的文本（真跑、读离线文件、或明确跳过）
+ */
+const CTX = {
+  manifest: null,
+  manifestLabel: '',
+  manifestSource: '',
+  profile: null,
+  profilePkg: null,
+  profilePkgPath: null,
+  dump: null,
+  dumpSummary: null,
+  skips: [],
+};
+
+/**
+ * 清单三路加载：显式 `--manifest` > 自动发现安装器那份 > 内置兜底。
+ * 自动发现**不是猜**：它读的是全局装着的 `@kira905/dsh-butler-install/suite-manifest.json`
+ * （这个包随 npm tarball 发布时就带着清单）。
+ */
+function loadManifestForRun() {
+  if (V.manifest !== undefined) {
+    try {
+      const m = loadManifest(V.manifest);
+      return { ok: true, manifest: m, label: `--manifest ${m.path}`, source: 'explicit' };
+    } catch (e) {
+      if (e instanceof ManifestError) return { ok: false, message: formatManifestError(e, String(V.manifest)) };
+      return { ok: false, message: `读清单失败：${e?.message ?? e}` };
+    }
+  }
+  const installer = findGlobalPackage('@kira905/dsh-butler-install');
+  if (installer) {
+    const file = path.join(installer.dir, 'suite-manifest.json');
+    if (fs.existsSync(file)) {
+      try {
+        const m = loadManifest(file);
+        return { ok: true, manifest: m, label: `自动发现 ${path.basename(file)}`, source: 'auto', path: file };
+      } catch (e) {
+        // 自动发现的那份坏了：不当成致命错误，退回内置兜底，但把原因记下来
+        const inner = loadManifestObject(DEFAULT_MANIFEST, '<内置兜底清单>');
+        return {
+          ok: true,
+          manifest: inner,
+          source: 'builtin',
+          label: `内置兜底（自动发现的那份读不了：${e instanceof ManifestError ? formatManifestError(e, file) : e?.message ?? e}）`,
+        };
+      }
+    }
+  }
+  const m = loadManifestObject(DEFAULT_MANIFEST, '<内置兜底清单>');
+  return { ok: true, manifest: m, label: `内置兜底 ${m.items.length} 项`, source: 'builtin' };
+}
+
+/** 定 profile：显式 --profile > profiles 下唯一一个 > 优先 web > 第一个 */
+function resolveProfile() {
+  const profilesDir = path.join(HOME, 'profiles');
+  if (V.profile !== undefined) {
+    const name = String(V.profile);
+    return { name, dir: path.join(profilesDir, name), explicit: true, available: readProfileNames(profilesDir) };
+  }
+  const names = readProfileNames(profilesDir);
+  if (!names.length) return null;
+  if (names.length === 1) return { name: names[0], dir: path.join(profilesDir, names[0]), explicit: false, available: names };
+  if (names.includes('web')) return { name: 'web', dir: path.join(profilesDir, 'web'), explicit: false, available: names };
+  return { name: names[0], dir: path.join(profilesDir, names[0]), explicit: false, available: names };
+}
+
+function readProfileNames(profilesDir) {
+  try {
+    return fs
+      .readdirSync(profilesDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name !== 'node_modules')
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+/** 读 profile 的 package.json（读不到就 null，不抛） */
+function readProfilePkg(dir) {
+  return readJsonSafe(path.join(dir, 'package.json'));
+}
+
+function readJsonSafe(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 取 dump 文本。三种来源，优先级：离线文件 > 真跑 > 明确跳过。
+ * 真跑时**用 DSH_HOME 指向本次自检的 home**，否则会读到另一个 home 的 profile（踩过）。
+ */
+function loadDumpText() {
+  if (F['no-dump']) return { mode: 'skipped', ok: false, reason: '--no-dump：按你的要求没跑 --dump-config' };
+  if (V['dump-config-file'] !== undefined) {
+    const file = path.resolve(String(V['dump-config-file']));
+    try {
+      return { mode: 'file', ok: true, text: fs.readFileSync(file, 'utf8'), file };
+    } catch (e) {
+      return { mode: 'file', ok: false, reason: `读不到离线 dump 文件：${file}（${e?.code ?? e?.message}）` };
+    }
+  }
+  if (!CTX.profile) return { mode: 'skipped', ok: false, reason: '没找到 profile 目录，无从跑 --dump-config' };
+  const resolved = resolveCommand('dsh', { extraRoots: [path.join(CTX.profile.dir, 'node_modules')] });
+  if (!resolved) return { mode: 'run', ok: false, reason: 'PATH 与全局 node_modules 里都没有能跑的 dsh（装主包：npm i -g @deepseek-ai/dsh）' };
+  const r = runPlan(spawnPlan(resolved, ['--profile', CTX.profile.name, '--dump-config']), {
+    timeout: Math.max(TIMEOUT, 20000),
+    label: 'dsh --profile X --dump-config',
+    extraEnv: { DSH_HOME: HOME },
+  });
+  const text = `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
+  if (r.rc !== 0) {
+    return { mode: 'run', ok: false, reason: `--dump-config rc=${r.rc ?? 'null'}：${tail(r.stderr || r.stdout || (r.error?.code ?? ''), 160)}`, text };
+  }
+  return { mode: 'run', ok: true, text, stderr: r.stderr ?? '', stdout: r.stdout ?? '' };
+}
+
+function initMountContext() {
+  const loaded = loadManifestForRun();
+  if (!loaded.ok) {
+    CTX.manifest = null;
+    CTX.manifestLabel = `清单不可用：${loaded.message}`;
+    CTX.manifestSource = 'error';
+    return;
+  }
+  CTX.manifest = loaded.manifest;
+  CTX.manifestLabel = loaded.label;
+  CTX.manifestSource = loaded.source;
+
+  CTX.profile = resolveProfile();
+  if (CTX.profile) CTX.profilePkg = readProfilePkg(CTX.profile.dir);
+  if (CTX.profile) CTX.profilePkgPath = path.join(CTX.profile.dir, 'package.json');
+
+  CTX.dump = loadDumpText();
+  if (CTX.dump.ok) {
+    CTX.dumpSummary = summarizeDump(CTX.dump.text);
+    // stderr 里的跳过记录优先从 stderr 抠；离线 dump 文件常常是 stdout+stderr 合在一起的，
+    // 所以合文本再抠一遍（同一行的两种来源会去重）。
+    const fromErr = parseSkipLines(CTX.dump.stderr ?? '');
+    const fromAll = parseSkipLines(CTX.dump.text ?? '');
+    const merged = [];
+    const seen = new Set();
+    for (const s of [...fromErr, ...fromAll]) {
+      const key = `${s.packageName}\u0000${s.reason}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(s);
+    }
+    CTX.skips = merged;
+  }
+}
+
+/** 一个包可能装在哪：profile 实体 / profiles 共享的 node_modules / 全局 */
+function collectInstalled(name) {
+  const found = [];
+  const tried = [];
+  const roots = [];
+  if (CTX.profile) roots.push({ where: 'profile', label: `${CTX.profile.name} profile`, root: path.join(CTX.profile.dir, 'node_modules') });
+  roots.push({ where: 'profile-shared', label: 'profiles 共享 node_modules', root: path.join(HOME, 'profiles', 'node_modules') });
+  for (const r of roots) {
+    tried.push(r.label);
+    const hit = findPackageInRoot(r.root, name);
+    if (hit) found.push({ where: r.where, label: r.label, ...hit });
+  }
+  const global = findGlobalPackage(name);
+  if (global) found.push({ where: 'global', label: `全局 node_modules（${global.root}）`, ...global });
+  else tried.push('全局 node_modules');
+  return { found, tried };
+}
+
+function installedWhereText(list) {
+  if (!list.length) return '都没找到';
+  return list.map((x) => x.label).join(' / ');
+}
+
+// 11 --------------------------------------------------------------- 包在不在 / 版本对不对
+function checkPackages() {
+  const NAME = '包在不在 / 版本对不对';
+  if (!CTX.manifest) {
+    add(11, NAME, 'SKIP', CTX.manifestLabel, '修好清单后重跑：--manifest <suite-manifest.json>');
+    return;
+  }
+  const items = CTX.manifest.items;
+  const rows = [];
+  for (const item of items) {
+    const probe = item.probe || {};
+    const rangeText = describeRange(parseRange(item.versionRange));
+    const { found, tried } = collectInstalled(item.name);
+
+    if (!found.length) {
+      rows.push({
+        item,
+        status: 'FAIL',
+        short: `${item.name}：未安装（${tried.join(' / ')} 都没有）`,
+      });
+      continue;
+    }
+    // 多个位置都有时，取"第一个命中"的版本作判据；其余位置只作说明
+    const primary = found[0];
+    const version = String(primary.pkg?.version ?? '');
+    const verdict = satisfies(item.versionRange, version);
+    const whereText = installedWhereText(found);
+    const extra = found.length > 1 ? `（另有 ${found.slice(1).map((x) => x.label).join(' / ')}）` : '';
+
+    if (verdict === 'yes') {
+      const cmdNote = item.type === 'cli' && probe.cmd ? ` · 命令 ${probe.cmd}` : '';
+      rows.push({ item, status: 'PASS', short: `${item.name}@${version} 在 ${whereText}${cmdNote}${extra}` });
+    } else if (verdict === 'no') {
+      rows.push({
+        item,
+        status: 'FAIL',
+        short: `${item.name} 版本越界：期望 ${rangeText}，实体 ${version}（在 ${whereText}）${extra}`,
+      });
+    } else {
+      rows.push({
+        item,
+        status: 'SKIP',
+        short: `${item.name}@${version} 版本无法判定（期望 ${rangeText}；带预发布后缀的实体版本本工具不猜，不算通过）`,
+      });
+    }
+  }
+
+  const fails = rows.filter((r) => r.status === 'FAIL');
+  const skips = rows.filter((r) => r.status === 'SKIP');
+  const pluginCount = items.filter((i) => i.type === 'plugin').length;
+  const cliCount = items.filter((i) => i.type === 'cli').length;
+  const srcNote = `清单来源：${CTX.manifestLabel}`;
+
+  if (fails.length) {
+    const brief = fails.slice(0, 5).map((r) => r.short).join('；') + (fails.length > 5 ? `；…等 ${fails.length} 项` : '');
+    add(
+      11,
+      NAME,
+      'FAIL',
+      `${items.length} 项里 ${fails.length} 项不过：${brief}（${srcNote}）`,
+      '缺就装：dsh plugin add <包>（插件）/ npm i -g <包>（命令行）。版本越界只报不修 —— 装哪个版本你自己定',
+    );
+    return;
+  }
+  if (skips.length) {
+    add(11, NAME, 'SKIP', `${skips.length} 项版本无法判定（不算通过）：${skips.map((r) => r.short).join('；')}（${srcNote}）`, '看一眼实体版本是否是你想要的');
+    return;
+  }
+  add(11, NAME, 'PASS', `清单 ${items.length} 项全部在位（plugin ${pluginCount} · cli ${cliCount}），版本都落在区间内（${srcNote}）`);
+}
+
+
+// 12 --------------------------------------------------------------- 挂载生效没
+/**
+ * 判「挂载生效没」。本项判的是**组合**，不是运行时 —— 这一点必须跟着结论一起读。
+ *
+ * 两个词在这里定死：
+ *   声明 = 包实体 `node_modules/<包>/package.json#dsh.bundle`
+ *   登记 = profile `package.json#dsh.profile.bundles`
+ */
+function checkMount() {
+  const NAME = '挂载生效没';
+  const runtimeNote = '本项判的是组合，不是运行时；要验"没崩"只能人工起一次 dsh web --no-open 看日志';
+
+  if (!CTX.manifest) {
+    add(12, NAME, 'SKIP', CTX.manifestLabel, '修好清单后重跑：--manifest <suite-manifest.json>');
+    return;
+  }
+  if (!CTX.profile) {
+    add(12, NAME, 'SKIP', `该 home 下没有 profile 目录（profiles 下没有子目录）`, '装一个 profile 后重跑；或用 --profile 指定');
+    return;
+  }
+  if (!CTX.profilePkg) {
+    add(
+      12,
+      NAME,
+      'FAIL',
+      `读不到 profile 的 package.json：${CTX.profilePkgPath}（profile 没初始化完？）`,
+      `先装一次插件或用 dsh plugin --profile ${CTX.profile.name} install 初始化 profile`,
+    );
+    return;
+  }
+
+  const bundlesRaw = CTX.profilePkg?.dsh?.profile?.bundles;
+  const bundles = Array.isArray(bundlesRaw) ? bundlesRaw.map(String) : [];
+  const treeKnown = !!(CTX.dump && CTX.dump.ok);
+  const summary = CTX.dumpSummary;
+  const problems = [];
+  const cells = { allThree: 0, declaredNotRegistered: 0, registeredNotInTree: 0, cliClass: 0, registeredWithoutBundle: 0, treeUnknown: 0 };
+  let notInstalled = 0;
+
+  const pluginItems = CTX.manifest.items.filter((i) => i.type === 'plugin');
+  for (const item of pluginItems) {
+    const { found } = collectInstalled(item.name);
+    if (!found.length) {
+      // 包都没装 —— 第 11 项会报，这里不重复判红
+      notInstalled += 1;
+      continue;
+    }
+    const primary = found[0];
+    const hasBundle = !!(primary.pkg && primary.pkg.dsh && primary.pkg.dsh.bundle);
+    const registered = bundles.includes(item.name);
+    const inTree = treeKnown ? summary.hasBundle(item.name) : false;
+    const skipped = CTX.skips.find((s) => s.packageName === item.name) ?? null;
+    const verdict = judgeMount({ name: item.name, hasBundle, registered, treeKnown, inTree, skipped });
+
+    if (verdict.cell === 'all-three') cells.allThree += 1;
+    else if (verdict.cell === 'declared-not-registered') cells.declaredNotRegistered += 1;
+    else if (verdict.cell === 'registered-not-in-tree') cells.registeredNotInTree += 1;
+    else if (verdict.cell === 'registered-without-bundle') cells.registeredWithoutBundle += 1;
+    else if (verdict.cell === 'tree-unknown') cells.treeUnknown += 1;
+    else cells.cliClass += 1;
+
+    if (verdict.verdict === 'FAIL') {
+      const attr = verdict.attribution ? `（归因 ${verdict.attribution}）` : '';
+      problems.push(`${item.name}：${verdict.message}${attr}`);
+    }
+  }
+
+  // 宿主 stderr 里的跳过记录：一行字符串匹配就当 FAIL 依据。
+  // ⚠️ 它兜不住最危险的那一格（"声明了 bundle 但没登记"时宿主一个字都不给），所以只是补充。
+  for (const s of CTX.skips) {
+    if (problems.some((p) => p.startsWith(`${s.packageName}：`))) continue;
+    problems.push(`${s.packageName} 被宿主跳过：${SKIP_ATTRIBUTION[s.kind] ?? SKIP_ATTRIBUTION.other}（原话：${tail(s.reason, 120)}）`);
+  }
+
+  // 撞 id / 撞 name：**跨 bundle 段头**才算撞（同一个 bundle 被 patch 重打会重复打印同一批条目，那是正常现象）
+  if (treeKnown) {
+    for (const c of findCollisions(summary)) {
+      problems.push(`${c.kind === 'id' ? '撞 id' : '撞 name'}：${c.key} 出现在 ${c.heads.length} 个 bundle 段（${c.heads.join(' | ')}）`);
+    }
+  }
+
+  // 位置互斥（只覆盖"记忆位置"这一处，不是万能判据）
+  const MEMORY_SLOTS = ['dsh-memory', '@kira905/dsh-memory-toolkit'];
+  const memoryBoth = MEMORY_SLOTS.filter((n) => bundles.includes(n));
+  if (memoryBoth.length > 1) {
+    problems.push(`抢同一个记忆位置：bundles 里同时有 ${memoryBoth.join(' 与 ')}（二选一，摘掉一条）`);
+  }
+
+  const stat = `三格齐 ${cells.allThree} · CLI 类 ${cells.cliClass}${notInstalled ? ` · 未装 ${notInstalled}` : ''}`;
+
+  if (problems.length) {
+    const brief = problems.slice(0, 5).join('；') + (problems.length > 5 ? `；…等 ${problems.length} 处` : '');
+    add(
+      12,
+      NAME,
+      'FAIL',
+      `${problems.length} 处不过：${brief}（${runtimeNote}）`,
+      '按每条处置做：没登记的补 `dsh plugin add <包>`；树里没有的看归因；撞车的摘掉重复那条',
+    );
+    return;
+  }
+  if (pluginItems.length && notInstalled === pluginItems.length) {
+    add(
+      12,
+      NAME,
+      'SKIP',
+      `清单里的 ${pluginItems.length} 项 plugin 一个都没装（第 11 项已报未安装），挂载无从判（${runtimeNote}）`,
+      '先把清单里的组件装上，再回来看这一项；只想验骨架的话这项可以忽略',
+    );
+    return;
+  }
+  if (!treeKnown) {
+    add(
+      12,
+      NAME,
+      'SKIP',
+      `文件层面 ${pluginItems.length - notInstalled} 项都正常（声明 + 登记都在，${stat}），但组合树维度没判：${CTX.dump?.reason ?? '没有 dump'}（${runtimeNote}）`,
+      `补上组合树判据：保证能跑 dsh --profile ${CTX.profile.name} --dump-config，或用 --dump-config-file 喂一份离线 dump`,
+    );
+    return;
+  }
+  add(
+    12,
+    NAME,
+    'PASS',
+    `组合树已判（dump ${summary.lineCount} 行 · ${summary.bundleHeads.length} 个 bundle 段）：${pluginItems.length} 项 plugin 全绿（${stat}）· 撞 id/name 0 处 · 位置互斥 0 处（${runtimeNote}）`,
+  );
+}
+
+// 13 --------------------------------------------------------------- 关键能力能不能跑
+/** 整批墙钟上限：探针一条最坏等 8 秒，十几条就是一分多钟，所以整批封顶 30 秒，超了剩下的整体降级 SKIP */
+const PROBE_BATCH_MS = (() => {
+  const n = Number(V['probe-batch']);
+  return Number.isFinite(n) && n > 0 ? n : 30000;
+})();
+
+/**
+ * 跑一条探针。三种 kind：
+ *   existence —— 只查文件在不在，**零执行**（默认）
+ *   help      —— 跑 `--help`；**仅限清单给了 helpVerified 的命令**（对没实现的命令，--help 是真动作）
+ *   cmd       —— 跑清单指定的只读命令（清单必须写 readonlyBecause）
+ * 另外 plugin 类可带 probe.api（只读 HTTP GET）。
+ */
+async function probeOne(item) {
+  const probe = item.probe || {};
+  const kind = probe.kind || 'existence';
+  const extraRoots = CTX.profile ? [path.join(CTX.profile.dir, 'node_modules')] : [];
+
+  if (kind === 'existence') {
+    const { found, tried } = collectInstalled(item.name);
+    if (item.type === 'cli') {
+      const cmd = String(probe.cmd ?? '');
+      const resolved = resolveCommand(cmd, { extraRoots });
+      if (resolved) {
+        const at = resolved.kind === 'node' ? `${resolved.packageName}@${resolved.version ?? '?'}（可见 node_modules）` : `壳文件 ${resolved.file}`;
+        return { item, status: 'PASS', short: `${item.name}：命令 ${cmd} 可解析 → ${at}（只查存在，未执行）` };
+      }
+      return { item, status: 'FAIL', short: `${item.name}：命令 ${cmd} 在 PATH 与已查 node_modules 里都没有（查过：${tried.join(' / ')}）` };
+    }
+    if (!found.length) return { item, status: 'FAIL', short: `${item.name}：包实体不在（${tried.join(' / ')} 都没有）` };
+    const entry = pluginEntry(found[0].dir);
+    if (entry.ok) return { item, status: 'PASS', short: `${item.name}：entry 在（${path.relative(found[0].dir, entry.file)}；只查存在，未执行）` };
+    return { item, status: 'FAIL', short: `${item.name}：包在但没有可加载的 entry（package.json 的 main/exports 与 lib/index.js 都没命中）` };
+  }
+
+  if (kind !== 'existence') {
+    const plan = planProbe(item);
+    if (plan.mode === 'skip') return { item, status: 'SKIP', short: `${item.name}：${plan.why}` };
+    if (plan.mode !== 'exec') return { item, status: 'SKIP', short: `${item.name}：探针计划异常（${plan.mode}）` };
+
+    const resolved = resolveCommand(String(probe.cmd), { extraRoots });
+    if (!resolved) return { item, status: 'FAIL', short: `${item.name}：探针命令 ${probe.cmd} 找不到（命令在不在由第 11 项判，这里只报探针没能跑）` };
+    const r = runPlan(spawnPlan(resolved, plan.args), { timeout: TIMEOUT, label: `probe ${plan.label}` });
+    const label = plan.label;
+    if (r.rc === null && (r.error?.code === 'ETIMEDOUT' || /timed? ?out/i.test(String(r.error?.message ?? '')))) {
+      return { item, status: 'SKIP', short: `${item.name}：探针 ${label} 超时（>${TIMEOUT}ms）—— 超时不算通过` };
+    }
+    if (r.rc === 0) {
+      const expect = typeof probe.expect === 'string' ? probe.expect : '';
+      if (expect) {
+        const hay = `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
+        let hit = false;
+        try {
+          hit = new RegExp(expect).test(hay);
+        } catch {
+          hit = hay.includes(expect);
+        }
+        if (!hit) return { item, status: 'FAIL', short: `${item.name}：${label} rc=0 但输出不含期望 ${JSON.stringify(expect)}；首行：${tail(firstLine(r.stdout || r.stderr), 120)}` };
+      }
+      return { item, status: 'PASS', short: `${item.name}：${label} rc=0` };
+    }
+    const first = firstLine(r.stderr) || firstLine(r.stdout) || String(r.error?.code ?? '');
+    return { item, status: 'FAIL', short: `${item.name}：${label} rc=${r.rc ?? 'null'}；首行错误：${tail(first, 160)}` };
+  }
+
+  return { item, status: 'SKIP', short: `${item.name}：未知探针类型 ${JSON.stringify(kind)}（只认 existence / help / cmd）` };
+}
+
+function firstLine(s) {
+  return String(s ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean)[0] ?? '';
+}
+
+/** plugin 类的只读 HTTP 探针（清单里 probe.api 给了才跑） */
+async function probeApi(item) {
+  const api = String(item.probe?.api ?? '');
+  if (!api) return null;
+  if (F['no-net']) return { item, status: 'SKIP', short: `${item.name}：--no-net，跳过只读 API ${api}` };
+  const base = String(V['api-base'] ?? 'http://127.0.0.1:3080').replace(/\/+$/, '');
+  const r = await httpProbe(base + api);
+  if (r.ok) return { item, status: 'PASS', short: `${item.name}：GET ${api} → HTTP ${r.status}` };
+  if (r.status === 401 || r.status === 403) return { item, status: 'PASS', short: `${item.name}：GET ${api} → HTTP ${r.status}（服务在，需要登录凭据）` };
+  if (r.status > 0) return { item, status: 'FAIL', short: `${item.name}：GET ${api} → HTTP ${r.status}` };
+  return { item, status: 'SKIP', short: `${item.name}：GET ${api} 连不上（${r.error ?? '服务没起'}）` };
+}
+
+async function checkProbes() {
+  const NAME = '关键能力能不能跑';
+  if (!CTX.manifest) {
+    add(13, NAME, 'SKIP', CTX.manifestLabel, '修好清单后重跑：--manifest <suite-manifest.json>');
+    return;
+  }
+  const items = CTX.manifest.items;
+  const started = Date.now();
+  const rows = [];
+  let degraded = 0;
+  // 包都没装的，探针无从跑 —— 第 11 项已经报过"未安装"，这里只记 SKIP，不重复刷红
+  const notInstalled = new Set();
+  for (const item of items) {
+    if (!collectInstalled(item.name).found.length) notInstalled.add(item.name);
+  }
+
+  for (const item of items) {
+    if (shouldDegradeBatch(started, Date.now(), PROBE_BATCH_MS)) {
+      degraded += 1;
+      continue;
+    }
+    if (notInstalled.has(item.name)) {
+      rows.push({ item, status: 'SKIP', short: `${item.name}：包没装，探针无从跑（第 11 项已报未安装）` });
+      continue;
+    }
+    rows.push(await probeOne(item));
+    const apiRow = await probeApi(item);
+    if (apiRow) rows.push(apiRow);
+  }
+
+  const elapsed = Date.now() - started;
+  const kinds = {};
+  for (const it of items) {
+    const k = it.probe?.kind || 'existence';
+    kinds[k] = (kinds[k] || 0) + 1;
+  }
+  const kindText = Object.entries(kinds).map(([k, n]) => `${k} ${n}`).join(' · ') || '无';
+
+  const fails = rows.filter((r) => r.status === 'FAIL');
+  const skips = rows.filter((r) => r.status === 'SKIP');
+  const batchNote = degraded
+    ? `；整批墙钟 ${(elapsed / 1000).toFixed(1)}s 超上限 ${PROBE_BATCH_MS / 1000}s，剩余 ${degraded} 项整体降级 SKIP（不是通过）`
+    : `；墙钟 ${(elapsed / 1000).toFixed(1)}s / 上限 ${PROBE_BATCH_MS / 1000}s`;
+
+  if (fails.length) {
+    add(
+      13,
+      NAME,
+      'FAIL',
+      `${fails.length} 项不过：${fails.map((r) => r.short).join('；')}（探针 ${kindText}${batchNote}）`,
+      '按每条的 rc / 首行错误原文去查；探针只读，不会改你的状态',
+    );
+    return;
+  }
+  if (skips.length || degraded) {
+    const sk =
+      skips.slice(0, 5).map((r) => r.short).join('；') + (skips.length > 5 ? `；…等 ${skips.length} 项` : '');
+    add(
+      13,
+      NAME,
+      'SKIP',
+      `${skips.length} 项探针没判过（不算通过）：${sk || '（无明细）'}${batchNote}`,
+      '装齐之后再跑一次；--help 只对清单声明过 helpVerified 的命令执行',
+    );
+    return;
+  }
+  add(13, NAME, 'PASS', `清单 ${items.length} 项探针全过（${kindText}${batchNote}；全部只读，未写任何状态）`);
+}
+
 // ---------------------------------------------------------------- --fix 初始化
 function applyFix() {
   const v = verdict(HOME, F['allow-production'] === true);
@@ -654,6 +1287,12 @@ async function main() {
   await checkStateFiles();
   checkTickd();
   checkIsolation();
+  // 第 11–13 项：清单驱动。放在写闸自检之后 —— 它们会跑一次 --dump-config（只读），
+  // 不该混进第 10 项的写入统计里。
+  initMountContext();
+  checkPackages();
+  checkMount();
+  await checkProbes();
 
   const counts = { pass: 0, fail: 0, skip: 0 };
   for (const c of CHECKS) counts[c.status.toLowerCase()] += 1;
@@ -673,6 +1312,28 @@ async function main() {
       counts,
       checks: CHECKS,
       writes: WRITES,
+      manifest: {
+        source: CTX.manifestSource || null,
+        label: CTX.manifestLabel || null,
+        path: CTX.manifest?.path ?? null,
+        items: CTX.manifest?.items.length ?? 0,
+        excluded: CTX.manifest?.excluded.length ?? 0,
+        entries: CTX.manifest
+          ? CTX.manifest.items.map((i) => ({ name: i.name, type: i.type, versionRange: i.versionRange, probeKind: i.probe?.kind ?? 'existence' }))
+          : [],
+      },
+      profile: CTX.profile ? { name: CTX.profile.name, explicit: CTX.profile.explicit === true, packageJson: CTX.profilePkgPath } : null,
+      dump: CTX.dump
+        ? {
+            mode: CTX.dump.mode,
+            ok: CTX.dump.ok === true,
+            reason: CTX.dump.reason ?? null,
+            lines: CTX.dumpSummary?.lineCount ?? null,
+            bundleSegments: CTX.dumpSummary?.bundleHeads ?? null,
+            pathLayers: CTX.dumpSummary?.pathLayers ?? null,
+            skippedBundles: CTX.skips,
+          }
+        : null,
     }, null, 2));
     return rc;
   }
@@ -681,6 +1342,14 @@ async function main() {
   say(`[自检] 判定        = ${kind}${v.writable ? '（可写）' : '（只读）'}${GUARD_ON ? ' · 夹具守卫开' : ''}`);
   say(`[自检] 骨架仓      = ${ROOT}`);
   say(`[自检] Node        = ${process.versions.node}`);
+  say(`[自检] 清单        = ${CTX.manifestLabel || '（未加载）'}${CTX.manifest ? ` · ${CTX.manifest.items.length} 项` : ''}`);
+  if (CTX.manifestSource === 'builtin') say(`                     ${DEFAULT_MANIFEST_SOURCE_NOTE}`);
+  say(`[自检] profile     = ${CTX.profile ? `${CTX.profile.name}${CTX.profile.explicit ? '（--profile 指定）' : '（自动）'}` : '（该 home 下没有）'}`);
+  say(
+    `[自检] dump        = ${
+      CTX.dump ? (CTX.dump.ok ? `已判（${CTX.dump.mode} · ${CTX.dumpSummary.lineCount} 行 · ${CTX.dumpSummary.bundleHeads.length} 个 bundle 段）` : `未判（${CTX.dump.reason}）`) : '未取'
+    }`,
+  );
   say('');
   const rows = CHECKS.map((c) => [String(c.id), c.name, c.status, c.detail]);
   say(table(rows, ['#', '检查项', '结果', '说明']));
