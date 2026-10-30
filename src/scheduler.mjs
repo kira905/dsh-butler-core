@@ -6,8 +6,26 @@
 //   - 每个 job 执行前抢自己的锁：抢不到 = 静默跳过（不是失败）
 //   - 记录每次 tick 的耗时 / 状态，落 ops-tickd.json（原子写，保留最近 50 次）
 //   - 本模块不自己起定时器；常驻循环在 CLI 层（bin/ops-tickd.mjs --interval）
+//
+// 实例级单例（`ensure()`，与 job 锁**不是一回事**）：
+//   job 锁管的是"两个 tick 别同时跑同一个 job"；实例锁管的是"别出现第二个调度器进程"。
+//   后者的病不在锁本身，而在"锁主还活着却被判死 ⇒ 删锁 ⇒ 起第二个 ⇒ 两个一起跑"——
+//   所以 ensure() 的语义是：**已存在活实例 ⇒ 拒删、返回 already-running**，绝不抢。
+//   拿到锁立刻写一次状态（③），消掉"拿到锁 → 第一次 tick 落盘"之间那段谁都看不见的空窗。
+//   fail-open（判不清就判活）的代价由 `checkLiveness()` 兜：连续 N 个周期没写出新状态 ⇒ 告警。
+import fs from 'node:fs';
 import { appendAudit } from './audit.mjs';
 import { alert } from './alert.mjs';
+import {
+  DEFAULT_LIVENESS_CYCLES,
+  DEFAULT_START_TIME_TOLERANCE_MS,
+  DEFAULT_TTL_MS,
+  computeLiveness,
+  lastStateWriteAtOf,
+  readInstanceState,
+  recordHeartbeat,
+  acquireInstanceLock,
+} from './lock.mjs';
 import { iso, newRunId, opsPaths } from './paths.mjs';
 import { acquireLock, readJson, updateJson } from './store.mjs';
 
@@ -15,7 +33,11 @@ export const TICKD_SCHEMA = 1;
 const MAX_RUNS = 50;
 
 /**
- * @param {{home:string, name?:string, logger?:(line:string)=>void, clock?:()=>number, audit?:boolean}} opts
+ * @param {{
+ *   home:string, name?:string, logger?:(line:string)=>void, clock?:()=>number, audit?:boolean,
+ *   instanceName?:string, instanceTtlMs?:number, startTimeToleranceMs?:number, startTimeOf?:Function,
+ *   livenessCycles?:number, livenessIntervalMs?:number,
+ * }} opts
  */
 export function createScheduler(opts) {
   if (!opts?.home) throw new Error('createScheduler: 需要 home');
@@ -30,6 +52,25 @@ export function createScheduler(opts) {
   };
   const doAudit = opts.audit !== false;
   const tasks = new Map();
+
+  // ── 实例级参数（都可配；默认值见 src/lock.mjs 文件头的时钟口径） ──────────────
+  // 实例锁名与 CLI 同名，不跟 name 走：它锁的是"tickd 这个进程"，不是某一个 job
+  const instanceName = opts.instanceName ?? 'ops-tickd-instance';
+  const instanceTtlMs = Number.isFinite(opts.instanceTtlMs) ? opts.instanceTtlMs : DEFAULT_TTL_MS;
+  const toleranceMs = Number.isFinite(opts.startTimeToleranceMs)
+    ? opts.startTimeToleranceMs
+    : Math.min(DEFAULT_START_TIME_TOLERANCE_MS, instanceTtlMs);
+  const livenessCycles = Number.isInteger(opts.livenessCycles) ? opts.livenessCycles : DEFAULT_LIVENESS_CYCLES;
+  /** 失败环的采样周期：默认取已注册 job 里最短的间隔（没有 job 时 60 s）。 */
+  const livenessIntervalMs = () => {
+    if (Number.isFinite(opts.livenessIntervalMs) && opts.livenessIntervalMs > 0) return opts.livenessIntervalMs;
+    let min = Infinity;
+    for (const t of tasks.values()) min = Math.min(min, t.intervalMs);
+    return Number.isFinite(min) && min > 0 ? min : 60_000;
+  };
+
+  /** 本进程持有的实例锁（null = 还没 ensure / 没抢到）。 */
+  let instance = null;
 
   function register(spec) {
     if (!spec || typeof spec.id !== 'string' || !spec.id) throw new Error('scheduler.register: 需要字符串 id');
@@ -69,6 +110,130 @@ export function createScheduler(opts) {
     return readJson(opsPaths(home).tickd, { defaultValue: { schemaVersion: TICKD_SCHEMA, runs: [], jobs: {} } });
   }
 
+  /**
+   * 写一次"实例状态"。这是 ③ 的落地：拿到锁**立刻**写，不等第一轮 tick。
+   * 失败环（checkLiveness）判的就是这个字段的推进 —— 所以它必须由"每轮 tick"也更新（见 persistTick）。
+   */
+  function writeInstanceState(at, extra = {}) {
+    const p = opsPaths(home);
+    try {
+      updateJson(p.tickd, (cur) => ({
+        ...(cur ?? {}),
+        schemaVersion: TICKD_SCHEMA,
+        runs: Array.isArray(cur?.runs) ? cur.runs : [],
+        jobs: cur?.jobs ?? {},
+        instance: {
+          ...(cur?.instance ?? {}),
+          name: instanceName,
+          pid: process.pid,
+          lockFile: instance?.file ?? extra.lockFile ?? null,
+          runId: instance?.payload?.runId ?? extra.runId ?? null,
+          since: cur?.instance?.pid === process.pid ? (cur?.instance?.since ?? iso(at)) : iso(at),
+          ...extra.instancePatch,
+        },
+        lastStateWriteAt: iso(at),
+        liveness: cur?.liveness ?? null,
+      }), { defaultValue: { schemaVersion: TICKD_SCHEMA, runs: [], jobs: {} } });
+      return true;
+    } catch (e) {
+      alert({ level: 'warn', source: 'ops-scheduler', message: `实例状态落盘失败：${e?.message ?? e}` }, { home, silent: true });
+      return false;
+    }
+  }
+
+  /**
+   * 拿实例锁并立刻写一次状态（②③）。
+   * @returns {{ok:true, file:string, release:Function, instance:object}
+   *          |{ok:false, reason:'already-running'|'reclaim-race', judge:object, holder:object|null, message:string}}
+   */
+  function ensure(overrides = {}) {
+    if (instance) return { ok: true, already: true, file: instance.file, release: () => {}, instance };
+    const r = acquireInstanceLock({
+      home,
+      name: overrides.name ?? instanceName,
+      ttlMs: Number.isFinite(overrides.ttlMs) ? overrides.ttlMs : instanceTtlMs,
+      startTimeToleranceMs: Number.isFinite(overrides.startTimeToleranceMs) ? overrides.startTimeToleranceMs : toleranceMs,
+      startTimeOf: overrides.startTimeOf ?? opts.startTimeOf,
+      isAliveOf: overrides.isAliveOf,
+      runId: overrides.runId ?? newRunId('inst'),
+      audit: doAudit,
+      extra: overrides.extra,
+    });
+    if (!r.ok) {
+      // 活实例 ⇒ 只报告，绝不删锁、也绝不写状态（写状态会被当成"我正在跑"）
+      log(`ensure: ${r.message}`);
+      return r;
+    }
+    instance = r;
+    writeInstanceState(clock(), { lockFile: r.file });
+    return r;
+  }
+
+  /** 心跳：只作证据（写 *.lock.beat），不参与任何判定。 */
+  function heartbeat(at = null) {
+    if (!instance) return { ok: false, reason: 'no-instance-lock' };
+    return recordHeartbeat(instance.file, { now: at ?? clock() });
+  }
+
+  /**
+   * ⑤ 失败环：连续 N 个周期没有写出新状态 ⇒ 告警（可配；同一段停摆只喊一次）。
+   * 它不看锁、不看 pid —— 所以在 fail-open 生效（锁主其实死了却判活）时照样能喊人。
+   */
+  function checkLiveness(o = {}) {
+    const at = Number.isFinite(o.now) ? o.now : clock();
+    const intervalMs = Number.isFinite(o.intervalMs) ? o.intervalMs : livenessIntervalMs();
+    const cycles = Number.isInteger(o.cycles) ? o.cycles : livenessCycles;
+    const p = opsPaths(home);
+    let mtimeMs = null;
+    try { mtimeMs = Math.round(fs.statSync(p.tickd).mtimeMs); } catch { mtimeMs = null; }
+    const cur = readJson(p.tickd, { defaultValue: null });
+    const lastStateWriteAt = lastStateWriteAtOf(cur, mtimeMs);
+    const lv = computeLiveness({ lastStateWriteAt, now: at, intervalMs, cycles });
+
+    const prev = cur?.liveness ?? null;
+    const wasStalled = prev?.stalled === true;
+    let alerted = false;
+    if (lv.stalled && !wasStalled && o.alertOnStall !== false) {
+      const message = `[${instanceName}] ${lv.message}`;
+      alert({
+        level: 'error',
+        source: 'ops-instance-liveness',
+        message,
+        detail: {
+          missedCycles: lv.missedCycles, threshold: lv.threshold, intervalMs: lv.intervalMs,
+          lastStateWriteAt: lv.lastStateWriteAt ?? null, lockPid: instance?.payload?.pid ?? null,
+        },
+      }, { home });
+      if (doAudit) appendAudit({ kind: 'instance.stalled', missedCycles: lv.missedCycles, threshold: lv.threshold, intervalMs: lv.intervalMs }, { home, silent: true });
+      alerted = true;
+      log(message);
+    }
+    if (lv.known) {
+      try {
+        updateJson(p.tickd, (c) => ({
+          ...(c ?? {}),
+          liveness: {
+            stalled: lv.stalled,
+            missedCycles: lv.missedCycles,
+            threshold: lv.threshold,
+            intervalMs: lv.intervalMs,
+            lastAlertAt: alerted ? iso(at) : (lv.stalled ? (prev?.lastAlertAt ?? null) : null),
+            checkedAt: iso(at),
+          },
+        }), { defaultValue: { schemaVersion: TICKD_SCHEMA, runs: [], jobs: {} } });
+      } catch { /* 状态写失败不影响告警 */ }
+    }
+    return { ...lv, alerted, intervalMs, cycles };
+  }
+
+  /** 释放实例锁（只删属于自己的那一版字节）。 */
+  function release() {
+    if (!instance) return false;
+    const ok = instance.release();
+    instance = null;
+    return ok;
+  }
+
   function persistTick(run, records) {
     const p = opsPaths(home);
     try {
@@ -86,7 +251,12 @@ export function createScheduler(opts) {
         return {
           schemaVersion: TICKD_SCHEMA,
           lastTickAt: run.at,
+          // 每轮 tick 落盘也算"写出了新状态"：失败环判的就是这两个字段的推进
+          lastStateWriteAt: run.at,
           lastRunId: run.runId,
+          // instance / liveness 必须原样保留 —— 否则每轮 tick 都会把"谁拿着锁、有没有停摆"抹掉
+          instance: cur?.instance ?? null,
+          liveness: cur?.liveness ?? null,
           runs: runs.slice(-MAX_RUNS),
           jobs,
         };
@@ -156,6 +326,8 @@ export function createScheduler(opts) {
     const at = now ?? clock();
     const runId = newRunId(`tick-${name}`);
     const results = [];
+    // 心跳只作证据，写在最前面：这一轮会跑很久也能让"实例还在动"留痕
+    if (instance) heartbeat(at);
     if (doAudit) appendAudit({ kind: 'tick.start', runId, at: iso(at), force, only }, { home, silent: true });
     for (const task of tasks.values()) {
       if (only && !only.includes(task.id)) continue;
@@ -174,5 +346,13 @@ export function createScheduler(opts) {
     return run;
   }
 
-  return { name, home, register, list, tickOnce, readState, tasks };
+  return {
+    name, home, register, list, tickOnce, readState, tasks,
+    // 实例级（本卡新增）：ensure / heartbeat / checkLiveness / release / instanceState
+    ensure, heartbeat, checkLiveness, release,
+    get instance() { return instance; },
+    get instanceName() { return instanceName; },
+    get livenessConfig() { return { cycles: livenessCycles, intervalMs: livenessIntervalMs() }; },
+    instanceState: (o = {}) => readInstanceState(home, { intervalMs: livenessIntervalMs(), cycles: livenessCycles, ...o }),
+  };
 }

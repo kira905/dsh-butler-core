@@ -13,7 +13,9 @@ const modules = [
   'test-global-paths.mjs', // W1 零 spawn 读盘探测
   'test-backcompat.mjs', // 旧 10 项不受清单影响
   'test-selfcheck-e2e.mjs', // 第 11/12/13 项端到端（假 home / 假包 / 假 dump）
+  'test-instance-lock.mjs', // K2：调度器单实例守卫（活锁 / pid 撞号 / 孤儿双跑 / fail-open / 失败环）
   'test-mutation.mjs', // 把判定改反 ⇒ 夹具必须红
+  'test-mutation-lock.mjs', // 同上，落点 = 单实例守卫（lock.mjs）
 ];
 
 let pass = 0;

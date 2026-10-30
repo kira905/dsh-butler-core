@@ -145,6 +145,8 @@ daily-report   ok    8       ok
 | `ops-alert.log` | 组件自身 | 首次告警时自动建；是产物 |
 | `ops-reports/<日期>.md` | `daily-report` job | 下一轮自动重建当天那份 |
 | `ops-locks/*.lock` | 调度器 | 首次加锁时自动建；进程崩溃会留过期锁（由自愈清理） |
+| `ops-locks/ops-tickd-instance.lock` | `scheduler.ensure()` | **别手删**（删了等于允许起第二个调度器）；孤儿锁由下一次 `ensure()` 按"pid 已死 / pid 被复用"回收，见 §7.1 |
+| `ops-locks/ops-tickd-instance.lock.beat` | `scheduler.heartbeat()` | 心跳**只作证据**：缺了不代表实例死了，新了也不代表它活着（见 §7.3） |
 | `ops-heal-log.jsonl` | `self-heal` job | 首次修复动作时自动建；是产物 |
 | `ops-changelog/<年-月>.md` | `ops-changelog add` | 第一次记账时自动建 |
 
@@ -203,6 +205,77 @@ const job = makeQueueNotifyJob({
    `ops-tickd --state` 的链校验里暴露。
 3. **单例锁 + 幂等**：每个 job 执行前用 `wx` 原子抢锁；抢不到 = 本轮跳过（不是失败）。
    日报"内容相同就不写"，通知"同一条只发一次" —— 重复跑不产生重复记账。
+   ⚠️ 这只是**job 锁**（别让两个 tick 同时跑同一个 job）。**调度器进程本身**的互斥是另一件事，
+   见下一节 —— 它比"过期就回收"复杂得多。
+
+---
+
+## 7.1 调度器单实例：锁为什么不能只看 TTL
+
+`ops-tickd --interval` 是长跑进程。如果它被起了两份，通知会重复发、日报会互相覆盖。
+最常见的翻车方式**不是**"忘了加锁"，而是**加错了判据**：
+
+> 锁主还活着，但 TTL 到期了 ⇒ 被判"过期" ⇒ 删锁 ⇒ 起第二个 ⇒ 两个一起跑。
+
+TTL 是"多久没动静算死"，可它答不了"**那个进程还在不在**"。所以 `src/lock.mjs` 把判定拆成两条互不冒充的问题：
+
+| 问题 | 判据 | 答不了时怎么办 |
+|---|---|---|
+| 锁主还在不在？ | `process.kill(pid, 0)`：成功 / `EPERM` = 活，`ESRCH` = 死 | 判不了 ⇒ **fail-open 判活**（不删锁） |
+| 这个 pid 还是当初那个进程吗？ | **只看方向**：进程启动时间 **晚于** 锁 `startedAt`（超容差）才可能是 pid 复用；**早于** ⇒ 同一个进程 | 取不到启动时间 ⇒ **fail-open 判活** + 写审计 |
+
+三条写死的口径（改之前先读 `src/lock.mjs` 文件头）：
+
+1. **方向，不是绝对差。** 两个时间戳都来自墙钟：宿主休眠 / NTP 校时 / 跨时区迁移之后，
+   差值会变负或变成巨值。按 `|差| > 阈值` 判 ⇒ 负值判"不是撞号"（于是删锁起第二个，正是上面那条翻车路径），
+   巨值判"是撞号"（判活/判死反向）。按方向判，两种异常都落在安全侧。
+2. **判不清就判活，但要写审计。** 出现负差、读不到时钟、pid 存活判不了 —— 一律 `fail-open` 判 alive，
+   并各写一行审计（`instance.lock-fail-open` / `instance.lock-clock-skew`）。这是明面行为，不是隐式兜底。
+3. **容差可配，默认 120 s。** 它只需要盖住「同一进程的启动时刻」与「它写锁的时刻」之间的自然差
+   （量级 < 3 s），不是盖住 tick 间隔；默认取生产侧 TTL 的最小档 120 s，并允许派生 `min(ttlMs, 120s)`。
+
+## 7.2 fail-open 的出口：连续 N 个周期没写出新状态 ⇒ 告警
+
+fail-open 的代价是：**锁主真的死了却被判活 ⇒ 第二个实例永不启动 ⇒ 调度静默停摆**。
+这比"双实例"更贵，因为它是静默的。所以配了一条只看"状态有没有在推进"的出口：
+
+```js
+const lv = scheduler.checkLiveness();   // 读 ops-tickd.json 的 lastStateWriteAt
+if (lv.stalled) { /* 已自动 alert（source=ops-instance-liveness）+ 写审计 instance.stalled */ }
+```
+
+- **N 可配**：`createScheduler({ livenessCycles: 3, livenessIntervalMs: 60_000 })`（默认 3 个周期）。
+- **同一段停摆只喊一次**（否则每轮一条，人会直接把通道关掉）；状态一推进就自动解除。
+- **从没写出过状态** ⇒ 判 `never-started`，不喊"停摆"（新装第一天不该误报）。
+- 出口的三条读数：`ops-alert.log`（告警）、`ops-audit/`（`instance.stalled`）、`ops-tickd --state`（人看）。
+
+## 7.3 心跳只作证据，不作判据
+
+`ops-locks/<实例>.lock.beat` 记录"上次见到这个实例动是什么时候"。它**不参与任何判定** ——
+否则又变回"用一个会停的时钟判生死"（心跳停了不等于进程死了；心跳很新也不等于进程还活着）。
+它存在只为两件事：排障时回答"它最后一次动是什么时候"、给审计留证据。
+
+## 7.4 Windows 上的已知限制（如实写）
+
+取进程启动时间需要读 `/proc/<pid>/stat`（Linux）。**Windows 上没有零依赖、零子进程的等价读法**，
+所以本组件在 Windows 上默认返回「取不到」⇒ 判定走 fail-open 判活（安全侧），由 7.2 的失败环兜底。
+想让 Windows 上也判 pid 撞号，把 `startTimeOf` 注入进来即可：
+
+```js
+// 例：调用方自己（在你那边、用你愿意的方式）先取一张「pid → 启动时刻(ms)」表，
+// 再把它注入进来。组件本身仍然零子进程 —— 起子进程这件事由调用方决定，不藏在判定路径里。
+const startedAtByPid = new Map([
+  [12345, Date.parse('2026-10-30T08:00:00+08:00')],
+]);
+
+createScheduler({
+  home,
+  startTimeOf: (pid) => startedAtByPid.get(pid) ?? null, // 表里没有 ⇒ null ⇒ 照旧 fail-open 判活
+});
+```
+
+反过来，**本进程自己**（"同一个进程反复 ensure"这个最常见的场景）在任何平台都取得准（`process.uptime()`），
+所以"自己手里的锁会不会被自己判死"这条铁律在两个平台上都成立。
 
 ---
 
@@ -220,7 +293,8 @@ const job = makeQueueNotifyJob({
 │   ├── audit.mjs            # 审计链唯一写入口
 │   ├── alert.mjs            # 告警通道
 │   ├── autonomy.mjs         # 自主矩阵（档位 / 模块 / 自动动作）
-│   ├── scheduler.mjs        # 轻量调度器（无常驻进程）
+│   ├── scheduler.mjs        # 轻量调度器（无常驻进程）+ 实例锁 ensure / 失败环 checkLiveness
+│   ├── lock.mjs             # 实例级单例锁：pid 存活 / pid 撞号（方向判据）/ fail-open / 心跳证据
 │   ├── registry.mjs         # 三个 job 的装配与顺序
 │   ├── state-files.mjs      # 状态文件清单的单一数据源
 │   ├── notify.mjs           # 通知适配器（file / webhook）
@@ -247,7 +321,9 @@ const job = makeQueueNotifyJob({
 │       ├── probe-plan.mjs   #   探针该不该跑（禁跑未核 --help）+ 整批墙钟
 │       └── default-manifest.mjs # 内置兜底清单（3 项）
 └── test/
-    └── run-all.mjs          # 夹具总入口（假 home / 假 profile / 假包 / 假 dump，全部临时目录）
+    ├── run-all.mjs          # 夹具总入口（假 home / 假 profile / 假包 / 假 dump，全部临时目录）
+    ├── test-instance-lock.mjs  # 单实例守卫：活锁 / pid 撞号 / 孤儿双跑 / fail-open / 失败环
+    └── test-mutation-lock.mjs  # 把单实例判据改反 ⇒ 上面的夹具必须红
 ```
 
 程序化用法：

@@ -3,6 +3,7 @@
 // 这张表同时服务三处：日报的健康检查、CLI 的 `state` 子命令、README / 复刻手册。
 // 每项都要回答：谁写的、缺了会怎样、能不能重建、能不能出机器。
 import fs from 'node:fs';
+import { readInstanceState } from './lock.mjs';
 import { opsPaths } from './paths.mjs';
 import { readJson } from './store.mjs';
 
@@ -112,6 +113,19 @@ export const STATE_FILES = [
     manual: '可删（下次 tick 会重建当天的）。',
   },
   {
+    id: 'instance',
+    path: (p) => p.instanceLock,
+    name: 'ops-locks/ops-tickd-instance.lock',
+    schema: 1,
+    writer: 'scheduler.ensure()（实例级单例锁）',
+    purpose: '调度器单实例：谁的 pid 拿着锁；同名 `.beat` 心跳只作证据（不作判据）',
+    required: false,
+    onMissing: '首次 ensure() 时创建；崩溃留下的孤儿锁由下一次 ensure 按「pid 已不存在 / pid 被复用」回收',
+    rebuildable: true,
+    sensitive: false,
+    manual: '**别手删**：删了等于允许起第二个调度器进程（两个一起跑会重复发通知）。要确认谁在跑：`ops-tickd --state`。',
+  },
+  {
     id: 'locks',
     path: (p) => p.locksDir,
     name: 'ops-locks/*.lock',
@@ -174,10 +188,33 @@ export function inspectStateFiles(home) {
   });
 }
 
-/** 只读的"一句话健康"：缺几个必需件 / 有没有坏 JSON。 */
-export function healthSummary(home) {
+/** 只读的"一句话健康"：缺几个必需件 / 有没有坏 JSON / 调度器有没有停摆。 */
+export function healthSummary(home, opts = {}) {
   const rows = inspectStateFiles(home);
   const missingRequired = rows.filter((r) => r.required && !r.exists).map((r) => r.name);
   const corrupt = rows.filter((r) => r.parse === false).map((r) => r.name);
-  return { rows, missingRequired, corrupt, ok: missingRequired.length === 0 && corrupt.length === 0 };
+  // 失败环：只读地算"连续几个周期没写出新状态"（不告警、不写盘 —— 告警由 scheduler.checkLiveness 发）
+  const liveness = instanceLiveness(home, opts);
+  return {
+    rows, missingRequired, corrupt, liveness,
+    ok: missingRequired.length === 0 && corrupt.length === 0,
+  };
+}
+
+/**
+ * 实例状态 + 失败环读数（只读）。
+ * 为什么单独导出而不塞进 healthSummary：调用方常常只想知道"调度器还在动吗"，不想顺手算全表。
+ * @param {string} home
+ * @param {{intervalMs?:number, cycles?:number, now?:number, lockName?:string}} [opts]
+ */
+export function instanceLiveness(home, opts = {}) {
+  const snap = readInstanceState(home, opts);
+  return {
+    ...snap.liveness,
+    instance: snap.instance,
+    lock: snap.lock,
+    lockFile: snap.lockFile,
+    heartbeat: snap.heartbeat,
+    lastStateWriteAt: snap.lastStateWriteAt,
+  };
 }

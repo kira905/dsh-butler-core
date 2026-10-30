@@ -45,6 +45,9 @@ export function opsPaths(home = resolveHome()) {
     alertLog: path.join(home, 'ops-alert.log'),
     reportsDir: path.join(home, 'ops-reports'),
     locksDir: path.join(home, 'ops-locks'),
+    // 实例级单例锁（锁的是"一个调度器进程"，与 job 锁不同；心跳只作证据）
+    instanceLock: path.join(home, 'ops-locks', 'ops-tickd-instance.lock'),
+    instanceBeat: path.join(home, 'ops-locks', 'ops-tickd-instance.lock.beat'),
     healLog: path.join(home, 'ops-heal-log.jsonl'),
     changelogDir: path.join(home, 'ops-changelog'),
   };

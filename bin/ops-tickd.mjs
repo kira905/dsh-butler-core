@@ -15,7 +15,7 @@ import { parseArgs, numArg, table } from '../src/cli.mjs';
 import { readAutonomy, describe } from '../src/autonomy.mjs';
 import { resolveHome, opsPaths } from '../src/paths.mjs';
 import { createOpsScheduler } from '../src/registry.mjs';
-import { healthSummary } from '../src/state-files.mjs';
+import { healthSummary, instanceLiveness } from '../src/state-files.mjs';
 import { verifyAuditChain } from '../src/audit.mjs';
 import { listLocks } from '../src/store.mjs';
 
@@ -52,27 +52,49 @@ else {
       const h = healthSummary(home);
       const chain = verifyAuditChain({ home });
       const locks = listLocks(home);
+      const instance = instanceLiveness(home);
       if (json) {
-        console.log(JSON.stringify({ home, health: h, auditChain: chain, locks }, null, 2));
+        console.log(JSON.stringify({ home, health: h, auditChain: chain, locks, instance }, null, 2));
       } else {
         console.log(`状态根：${home}`);
         console.log(table(h.rows.map((r) => [r.name, r.exists ? '存在' : '缺失', r.exists ? String(r.size) : '-', r.parse === null ? '—' : r.parse ? 'ok' : '坏']), ['文件', '状态', '字节', '解析']));
         console.log(`\n审计链：${chain.ok ? '完整' : `断 ${chain.breaks.length} 处`}（本月 ${chain.count} 行）`);
         console.log(`锁：${locks.length} 个${locks.length ? '（' + locks.map((l) => `${l.name}${l.expired ? '/过期' : ''}`).join('、') + '）' : ''}`);
+        const holder = instance.lock ? `pid ${instance.lock.pid}（自 ${instance.lock.at}）` : '无（没有人持有实例锁）';
+        const beat = instance.heartbeat ? `心跳 ${instance.heartbeat.at}（第 ${instance.heartbeat.count} 次，仅作证据）` : '无心跳';
+        const live = instance.known
+          ? `状态距今 ${instance.missedCycles} 个周期（阈值 ${instance.threshold}）${instance.stalled ? ' ⇒ **可能在静默停摆**' : ''}`
+          : '还没有"写出状态"的记录（从未启动过）';
+        console.log(`实例：${holder} · ${beat}`);
+        console.log(`实例活跃度：${live}`);
       }
-      process.exitCode = h.ok && chain.ok ? 0 : 3;
+      process.exitCode = h.ok && chain.ok && !instance.stalled ? 0 : 3;
     } else if (args.values.interval !== undefined) {
       const sec = numArg(args, 'interval', { min: 5, max: 86_400 });
       const { scheduler } = createOpsScheduler({ home, logger: log });
       const { state } = readAutonomy({ home, ensure: true });
-      log(`ops-tickd 常驻：home=${home} · 档位=${state.mode} · 每 ${sec}s 一轮 · Ctrl+C 退出`);
-      let stop = false;
-      process.on('SIGINT', () => { stop = true; log('收到 SIGINT，跑完当前轮后退出'); });
-      while (!stop) {
-        const run = await scheduler.tickOnce({ force: false });
-        for (const r of run.results) log(`  ${r.id}: ${r.status}${r.durationMs !== undefined ? ` (${r.durationMs}ms)` : ''}`);
-        if (stop) break;
-        await new Promise((resolve) => setTimeout(resolve, sec * 1000));
+      // 🔴 实例级单例守卫：**先 ensure 再起循环**。
+      // 已有活实例（或判不清 ⇒ fail-open 判活）⇒ 立刻退出，绝不当第二个调度器。
+      // 这一点是本骨架与"只判 TTL"的旧口径最大的差别：活锁不会被删，也不会被抢。
+      const guard = scheduler.ensure();
+      if (!guard.ok) {
+        log(`拒绝启动：${guard.reason} —— ${guard.message}`);
+        log('本进程不会成为第二个调度器。要确认谁在跑：ops-tickd --state');
+        process.exitCode = 3;
+      } else {
+        log(`ops-tickd 常驻：home=${home} · 档位=${state.mode} · 每 ${sec}s 一轮 · 实例锁 ${guard.file} · Ctrl+C 退出`);
+        let stop = false;
+        process.on('SIGINT', () => { stop = true; log('收到 SIGINT，跑完当前轮后退出'); });
+        while (!stop) {
+          const run = await scheduler.tickOnce({ force: false });
+          for (const r of run.results) log(`  ${r.id}: ${r.status}${r.durationMs !== undefined ? ` (${r.durationMs}ms)` : ''}`);
+          // ⑤ 失败环：连续 N 个周期没有写出新状态 ⇒ 告警（落 ops-alert.log + 审计；同一段只喊一次）
+          const lv = scheduler.checkLiveness();
+          if (lv.stalled) log(`失败环：${lv.message}`);
+          if (stop) break;
+          await new Promise((resolve) => setTimeout(resolve, sec * 1000));
+        }
+        scheduler.release();
       }
     } else {
       const only = args.values.only ? String(args.values.only).split(',').map((s) => s.trim()).filter(Boolean) : null;
