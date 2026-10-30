@@ -2,7 +2,31 @@
 
 本仓遵循语义化版本（`MAJOR.MINOR.PATCH`）。条目按版本倒序，最新在上。
 
-## 0.2.0 — 未发布（本地）
+## 0.3.0 — 2026-10-30
+
+**调度器单实例守卫（`src/lock.mjs`）：锁主还活着、TTL 却到期 ⇒ 不再删锁、不再起第二个实例；判不清就判活，并配「失败环」出口。**
+
+### 新增
+
+- `src/lock.mjs`（**调度器单实例守卫**）：实例级锁 + pid 存活 + **pid 撞号方向判据**（只看「进程启动时间
+  是否晚于锁 `startedAt`」，不看绝对差）+ 心跳只作证据 + 判不清时 **fail-open 判活并写审计**。
+  `scheduler.ensure()` 在删锁前先核「是否已有活实例」：活 ⇒ **拒删**并返回 `already-running`；
+  拿到锁**立刻写一次状态**（消掉"拿锁 → 写状态"的空窗）。
+- **⑤ 失败环**：`scheduler.checkLiveness()` —— 连续 N 个周期（`livenessCycles`，默认 3）没有写出新状态
+  ⇒ 告警（`source=ops-instance-liveness`）+ 审计 `instance.stalled`，同一段只喊一次；`ops-tickd --state`
+  也会显示实例与活跃度。这是 fail-open 的**唯一出口**：没有它，判活就会把"双实例"换成"零实例（静默停摆）"。
+- `bin/ops-tickd.mjs --interval`：启动时先 `ensure()`，已有活实例 ⇒ 拒绝启动、退出码 `3`（绝不当第二个调度器）。
+- `test/`：239 条断言 + 11 处变异测试（把四格 / 单实例守卫任意一条判定改反 ⇒ 夹具必须红）；夹具全用系统
+  临时目录里的假 home / 假 profile / 假包 / 假 dump，**不起真进程**（用假 instance 日志数实例）。
+
+### 两条诚实边界（本版新增）
+
+1. **Windows 上取不到"别的进程"的启动时间**（Linux 靠 `/proc/<pid>/stat`）⇒ pid 撞号判定走 fail-open 判活。
+   这是安全侧（宁可不起第二个，也不删活锁），但**必须**配失败环；想判准就注入 `startTimeOf`（见 README §7.4）。
+2. **fail-open 会用"静默停摆"换"双实例"** ⇒ `checkLiveness()` 不是可选装饰。锁主真死了却判活、第二个实例
+   永不启动，调度就静默停摆 —— 不跑失败环，等于把病换了一种形态。
+
+## 0.2.0 — 2026-10-30
 
 **装完自检从 10 项扩到 13 项，并修掉两个盲点。**
 
@@ -30,26 +54,14 @@
 - 新选项：`--manifest` · `--profile` · `--dump-config-file`（零执行解析离线 dump）· `--no-dump` · `--probe-batch`。
 - `scripts/lib/`：`manifest` / `semver`（**与安装器同源**）、`global-paths`（零 spawn）、`dump-parse`、
   `probe-plan`、`default-manifest`。
-- `src/lock.mjs`（**调度器单实例守卫**）：实例级锁 + pid 存活 + **pid 撞号方向判据**（只看「进程启动时间
-  是否晚于锁 `startedAt`」，不看绝对差）+ 心跳只作证据 + 判不清时 **fail-open 判活并写审计**。
-  `scheduler.ensure()` 在删锁前先核「是否已有活实例」：活 ⇒ **拒删**并返回 `already-running`；
-  拿到锁**立刻写一次状态**（消掉"拿锁 → 写状态"的空窗）。
-- **⑤ 失败环**：`scheduler.checkLiveness()` —— 连续 N 个周期（`livenessCycles`，默认 3）没有写出新状态
-  ⇒ 告警（`source=ops-instance-liveness`）+ 审计 `instance.stalled`，同一段只喊一次；`ops-tickd --state`
-  也会显示实例与活跃度。这是 fail-open 的**唯一出口**：没有它，判活就会把"双实例"换成"零实例（静默停摆）"。
-- `bin/ops-tickd.mjs --interval`：启动时先 `ensure()`，已有活实例 ⇒ 拒绝启动、退出码 `3`（绝不当第二个调度器）。
-- `test/`：239 条断言 + 11 处变异测试（把四格 / 单实例守卫任意一条判定改反 ⇒ 夹具必须红）；夹具全用系统
-  临时目录里的假 home / 假 profile / 假包 / 假 dump，**不起真进程**（用假 instance 日志数实例）。
+- `test/`：166 条断言 + 7 处变异测试（把四格任意一条判定改反 ⇒ 夹具必须红）；夹具全用系统临时目录里的
+  假 home / 假 profile / 假包 / 假 dump。
 
-### 四条诚实边界（已写进 detail 与 README）
+### 两条诚实边界（已写进 detail 与 README）
 
 1. `--dump-config` 只证明"组合树里有这一行"，**不证明"运行时没崩"** —— 后者只能人工起一次服务看日志。
 2. 它抓不到"撞 id"以外的运行时冲突（不同 `id` 抢同一位置 ⇒ dump 两行、宿主不报错）⇒ 第 12 项只覆盖
    "同 id / 同 name"这一种，**别当万能判据**。
-3. **Windows 上取不到"别的进程"的启动时间**（Linux 靠 `/proc/<pid>/stat`）⇒ pid 撞号判定走 fail-open 判活。
-   这是安全侧（宁可不起第二个，也不删活锁），但**必须**配失败环；想判准就注入 `startTimeOf`（见 README §7.4）。
-4. **fail-open 会用"静默停摆"换"双实例"** ⇒ `checkLiveness()` 不是可选装饰。锁主真死了却判活、第二个实例
-   永不启动，调度就静默停摆 —— 不跑失败环，等于把病换了一种形态。
 
 ## 0.1.1 — 2026-10-20
 
