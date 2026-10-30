@@ -1,5 +1,33 @@
 # dsh-butler-core · 最小可跑运维骨架
 
+> 本仓是命令行/库（3 个命令），其中 **`ops-tickd` 是常驻调度** —— 装完不是"跑一次就完"，要起进程并常驻；另外两个（`ops-autonomy` / `ops-changelog`）才是一次性命令。
+
+## 装完自检（三条只读验法）
+
+`<profile>` 换成你实际用的 profile（默认 `web`），`<数据根>` 换成你的 DSH 数据根（默认 `~/.dsh`）。
+
+```powershell
+# ① 组合树里有没有它（只读、约 0.6 秒、不启服务）
+dsh --profile <profile> --dump-config | Select-String "dsh-butler-core"
+# 期望：bundle 层出现一行 "# == <登记名>"、insert 层出现 "- id: <entry>"（问的都是「它挂上没」）；
+#       本仓包名 @kira905/dsh-butler-core —— 带 scope 装的写带 scope 名、老工装 / 手写的可能是裸名，两种都搜一遍
+#       ⚠️ 若该包会 insert 一行，还要数一遍"同一个 id 出现了几次"，必须 == 1
+
+# ② 组合列表里有没有它（只读）
+Get-Content <数据根>/profiles/<profile>/package.json | Select-String "@kira905/dsh-butler-core"
+# 期望：dependencies 与 dsh.profile.bundles 两处都有（CLI 类只需要 dependencies；bundles 里也可能写裸名 dsh-butler-core）
+
+# ③ 命令在不在 —— 【只查存在，不执行】
+Test-Path <数据根>/profiles/<profile>/node_modules/.bin/ops-autonomy.CMD   # 装进 profile 的
+Test-Path "$env:APPDATA\npm\ops-autonomy.CMD"                           # npm i -g 装的
+# 期望：True。两条路径按你实际用的装法挑一条
+```
+
+> 探针只做存在性检查（只看命令文件在不在，不执行任何命令）。
+> 要不要用 `--help` 验，见本仓当前说明与该命令的参数表。
+
+---
+
 > 一个**零运行时依赖**的 Node.js 小骨架：定时调度 + 自主闸门 + 通知队列 + 日报 + 审计链。
 > 它给「长期在自己机器上跑 agent」的人用——先让一个循环能跑起来、能留下可查的痕迹，再谈自动化。
 
