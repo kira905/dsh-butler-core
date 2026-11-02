@@ -1,5 +1,31 @@
 # dsh-butler-core · a minimal, runnable ops skeleton
 
+> ### What this is
+> **A minimal ops skeleton that actually runs**: a resident scheduler, autonomy gates, notifications, a daily report, and a hash-chained audit log.
+>
+> ### What it solves
+> The risk of letting an agent run unattended is not that it is slow — it is that **it does not know where the line is**. Which actions may it decide on its own, and which must wait for a human? That matrix lives here: every autonomous action carries its actor and reason and lands in a **hash-chained audit trail**, so afterwards you can answer "who did this, why, and when was it allowed".
+>
+> ### Run it in one command
+> ```powershell
+> npm i -g @kira905/dsh-butler-core
+> ops-autonomy status        # read-only: current autonomy tier (changes nothing)
+> ops-tickd                  # the resident scheduler - the only long-running process of the three
+> ```
+>
+> ### Real output
+> ```text
+> Usage
+>   ops-autonomy <status|mode|module|job|auto> [args] [--json]
+>
+> Autonomy matrix CLI: show the current tier, toggle modules / jobs / autonomous actions.
+> Every write action carries --by / --why and records one audit line.
+> ```
+>
+> Install steps and three read-only self-checks are below.
+
+---
+
 > A **zero-dependency** Node.js skeleton: tick scheduler + autonomy gate + queue notifications +
 > daily report + hash-chained audit log.
 > Built for people who keep agents running on their own machines: make one loop run, leave a
