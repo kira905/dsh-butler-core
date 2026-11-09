@@ -42,7 +42,7 @@
 
 ## 装完自检（三条只读验法）
 
-`<profile>` 换成你实际用的 profile（默认 `web`），`<数据根>` 换成你的 DSH 数据根（默认 `~/.dsh`）。
+`<profile>` 换成你实际用的 profile（放插件的那个格子，默认 `web`），`<数据根>` 换成你的 DSH 数据根（默认 `~/.dsh`）。
 
 ```powershell
 # ① 组合树里有没有它（只读、约 0.6 秒、不启服务）
@@ -416,7 +416,7 @@ node scripts/selfcheck-replica.mjs --home <你的状态根> --manifest <suite-ma
 | 9 | tickd 能跑一轮 | `--once --json` 退出码 0、job 齐、日报产出 | SKIP（真实 home 需 `--allow-production`） |
 | 10 | 生产/夹具隔离 | 写闸 3 条自测 + 本次写入全在 home 内 | FAIL |
 | 11 | 包在不在 / 版本对不对 | **分两路**：`plugin` 类读 profile 的 `dependencies` + 实体 `package.json` 的 `version`；`cli` 类查全局（也看 profile）。两处都没有才 FAIL | FAIL |
-| 12 | 挂载生效没 | 四格：包自己的 `dsh.bundle` × profile 的 `dsh.profile.bundles` × `--dump-config` 的组合树；外加"登记了但包没声明""撞 id/同 name""抢同一个记忆位置" | FAIL |
+| 12 | 挂载生效没 | 四格：包自己的 `dsh.bundle`（插件 `package.json` 里那行「让 DSH 启动时自动挂上我」的声明）× profile 的 `dsh.profile.bundles` × `--dump-config` 的组合树；外加"登记了但包没声明""撞 id/同 name""抢同一个记忆位置" | FAIL |
 | 13 | 关键能力能不能跑 | 每项探针由清单给：`existence`（只查存在，零执行）/ `help`（**仅限核过 `--help` 的命令**）/ `cmd`（清单指定的只读命令）；统一 8 秒超时 + 整批墙钟 30 秒 | FAIL |
 
 **第 11/12/13 项是清单驱动的**，清单优先取 `--manifest`；不给就自动找全局装着的
